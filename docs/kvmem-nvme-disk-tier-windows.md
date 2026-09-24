@@ -306,3 +306,38 @@ Verification caveat learned here: the `\LogicalDisk` performance counter
 files - disk deltas above were measured with direct `Get-PSDrive`/NTFS
 polling; spill itself was independently proven via `KVMEM_TRACE`
 (`stage_out_nvme` x44 in a forced-spill probe) plus external polling (-132 MB).
+
+### Clean-background retest after local commits (2026-09-24)
+
+Commits: `7dc917a` (AMD HIP port), `0f5ca89` (NVMe Win32 port). Post-commit
+matrix: host 5/5 (MSVC), HIP 13/13 (clang). The 5.1 GB background hog was
+terminated (user-authorized) before these runs.
+
+| Metric (122K fill, clean) | A: RAM-only (`cpu-gb 4`) | B: NVMe (`cpu-gb 1`+`nvme-gb 16`) |
+|---|---:|---:|
+| RAM peak used / min free | 39,362 / 8,950 MB | 38,622 / **9,690 MB** |
+| VRAM peak | 15,386 MB | 15,386 MB |
+| C: disk delta | **7 MB** (zero spill) | **3,061 MB** (KV on disk) |
+| prefill / decode | 218.6 / 25.1 t/s | 214.7 / 25.5 t/s (-1.8% prefill) |
+| retrieval | 3,864 ms | 4,032 ms (+4.3%) |
+| needle @82K | HIT | HIT |
+| temp reclaimed | n/a | EMPTY |
+
+**244K deep fill (NVMe, clean)**: completed - prefill 206 t/s (19.7 min),
+decode 25.7, retrieval 4.2 s, **C: delta 10.9 GB** (the disk absorbed the
+overflow), needle HIT at ~200K depth, RAM min-free 5.2 GB. This is at the
+capacity edge of a 47 GB machine with an 11.2 GB model; the RAM-only
+configuration cannot run 244K at all (needs an ~8.7 GB pinned arena on top).
+
+**Regression probes (32K, post-commit binary)**: pure-RAM 786.4 t/s,
+NVMe-config 785.4 t/s, pre-fix NVMe-config was 788 - the NVMe changes add no
+measurable prefill cost. The 244K prefill difference vs the pre-review run
+(375 -> 206 t/s) tracks host-memory headroom, not code: deep-fill harvest
+D2H is host-bound (`d2h_wait` 630 -> 1160 s) and the idle baseline had grown
+~2 GB, pushing min-free near the floor where the OS reclaims page cache
+aggressively.
+
+**Hostile-environment datapoint (kept for contrast)**: with the 5.1 GB
+background hog resident, RAM-only 122K was watchdog-KILLED (min-free
+4,963 MB, pagefile delta 4.6 GB) while NVMe 122K completed (min-free
+5,212 MB) with needle HIT - identical workload, identical machine.
