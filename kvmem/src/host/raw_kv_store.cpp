@@ -376,7 +376,33 @@ void RawKvStore::io_loop() {
         }
         NvmeBatchIoStats st;
         const uint64_t t0 = monotonic_ns();
-        nvme_->write_spans(sorted, slab.data(), slab.size(), &st);
+        try {
+            nvme_->write_spans(sorted, slab.data(), slab.size(), &st);
+        } catch (const std::exception & e) {
+            std::fprintf(stderr, "[kvmem-io] write_spans EXCEPTION: %s\n",
+                         e.what());
+            // Clear the flushing/inflight bookkeeping before rethrowing so
+            // cv_ waiters cannot hang if this fatal path is ever relaxed to
+            // "record, degrade, continue".
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                for (auto & job : batch) {
+                    if (job.block_id >= blocks_.size() ||
+                        job.il >= cfg_.n_layer) {
+                        continue;
+                    }
+                    LayerBlk & lb = blocks_[job.block_id].layers[job.il];
+                    if (job.is_v) {
+                        lb.v_flushing = false;
+                    } else {
+                        lb.k_flushing = false;
+                    }
+                }
+                inflight_ = 0;
+            }
+            cv_.notify_all();
+            throw;
+        }
         const uint64_t dt = monotonic_ns() - t0;
         {
             std::lock_guard<std::mutex> lk(mu_);

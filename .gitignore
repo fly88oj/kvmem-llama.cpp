@@ -13,3 +13,17 @@ __pycache__/
 /build-ui/
 
 /build-win*/
+
+# --- AMD HIP / ROCm port artifacts (native Windows + ROCm wheel venv) ---
+/.venv-rocm/
+/build-hip*/
+/build-host/
+/*.log
+
+# Local working docs and benchmark scratch (hard-coded developer paths;
+# not for upstream). The gen_*.py prompt generators stay tracked because
+# scripts/windows/needle.ps1 and the docs depend on them.
+/HANDOVER.md
+/tests-data/*
+!/tests-data/gen_bench.py
+!/tests-data/gen_needle.py

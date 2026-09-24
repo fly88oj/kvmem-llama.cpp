@@ -1,13 +1,9 @@
 #pragma once
 
-// Standalone header users retain the platform default; CMake publishes an
-// explicit value to every consumer of libkvmem.
+// Standalone header users get the tier on every supported platform; CMake
+// publishes an explicit value to every consumer of libkvmem.
 #ifndef KVMEM_ENABLE_NVME
-#ifdef _WIN32
-#define KVMEM_ENABLE_NVME 0
-#else
 #define KVMEM_ENABLE_NVME 1
-#endif
 #endif
 
 // NVMe KV tier — fixed-slot metadata plus positional byte I/O.
@@ -34,10 +30,48 @@
 #include <vector>
 
 #if KVMEM_ENABLE_NVME
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+
+// Platform file primitives, implemented in src/host/nvme_platform.cpp.
+// Positional and thread-safe (pread/pwrite semantics); windows.h and the
+// POSIX headers stay confined to that TU so this header remains includable
+// from HIP/clang translation units.
+namespace kvmem {
+namespace platform {
+
+#ifdef _WIN32
+using FileHandle = void *;  // HANDLE; INVALID_HANDLE_VALUE when closed
+#else
+using FileHandle = int;     // fd; -1 when closed
+#endif
+
+FileHandle invalid_handle();
+bool valid(FileHandle h);
+std::string last_error();
+// create/truncate mirror O_CREAT/O_TRUNC. delete_on_close reproduces
+// open-then-unlink with POSIX semantics (the directory entry disappears
+// immediately; data is reclaimed at last close / process death).
+// no_buffering requests O_DIRECT / FILE_FLAG_NO_BUFFERING; unsupported
+// platforms return an invalid handle so callers degrade to buffered I/O.
+FileHandle open_file(const std::string & path, bool read, bool write,
+                     bool create, bool truncate, bool delete_on_close,
+                     bool no_buffering);
+void close_file(FileHandle h);
+// One positional transfer. May be partial (caller loops); returns true with
+// *done == 0 at EOF, matching pread() == 0. False on error (last_error()).
+bool transfer_at(FileHandle h, void * buf, uint64_t bytes, uint64_t offset,
+                 uint64_t * done, bool write);
+// 0 = ok, 1 = unsupported (degrade to sparse growth), -1 = error.
+int fallocate(FileHandle h, uint64_t bytes);
+// Relinquish page-cache residency of [offset, offset+bytes); writeback first
+// when `write`. False (with last_error()) when the platform cannot.
+bool drop_cached_range(FileHandle h, uint64_t offset, uint64_t bytes,
+                       bool write);
+// 0 = ok, -1 = exists but is not a directory, -2 = creation failed.
+int ensure_dir(const std::string & dir);
+
+}  // namespace platform
+}  // namespace kvmem
+
 #endif
 
 namespace kvmem {
@@ -121,35 +155,53 @@ public:
         if (slot_count_ == 0 || cfg_.dir.empty()) return;
 
         ensure_dir(cfg_.dir);
-        if (cfg_.file_name.empty() ||
-            cfg_.file_name.find('/') != std::string::npos) {
+        if (!is_plain_basename(cfg_.file_name)) {
             throw std::runtime_error(
                 "NVMe KV tier file_name must be a non-empty basename");
         }
         path_ = cfg_.dir + "/" + cfg_.file_name;
-        int flags = O_CLOEXEC;
-        if (cfg_.read_only) {
-            flags |= O_RDONLY;
-        } else {
-            flags |= O_CREAT | O_RDWR;
-            if (!cfg_.durable) flags |= O_TRUNC;
-        }
-        fd_ = ::open(path_.c_str(), flags, 0644);
-        if (fd_ < 0) {
+        // The ephemeral (non-durable) arena is opened then deleted: both
+        // platforms remove the directory entry immediately while the data
+        // survives until the last handle closes, including abnormal exits.
+        // This also prevents stale kvmem_nvme.bin files from accumulating
+        // across evaluations.
+        fd_ = platform::open_file(
+            path_, /*read=*/true, /*write=*/!cfg_.read_only,
+            /*create=*/!cfg_.read_only,
+            /*truncate=*/!cfg_.read_only && !cfg_.durable,
+            /*delete_on_close=*/!cfg_.durable, /*no_buffering=*/false);
+        if (!platform::valid(fd_)) {
             throw std::runtime_error(
                 "failed to open NVMe KV tier file: " + path_ + ": " +
-                std::strerror(errno));
+                platform::last_error());
         }
+        // Ctor-throw safety: a throwing constructor never runs ~NvmeKvTier,
+        // so close any already-opened descriptors if a later step throws
+        // (including bad_alloc from the free-slot vector below).
+        struct HandleGuard {
+            platform::FileHandle * primary;
+            platform::FileHandle * direct;
+            platform::FileHandle * overlay;
+            bool armed = true;
+            ~HandleGuard() {
+                if (armed) {
+                    platform::close_file(*overlay);
+                    platform::close_file(*direct);
+                    platform::close_file(*primary);
+                }
+            }
+        } guard { &fd_, &direct_fd_, &overlay_fd_ };
         if (cfg_.direct_read && cfg_.durable && cfg_.read_only) {
-#if defined(__linux__) && defined(O_DIRECT)
-            direct_fd_ = ::open(
-                path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-            if (direct_fd_ < 0) {
+            direct_fd_ = platform::open_file(
+                path_, /*read=*/true, /*write=*/false, /*create=*/false,
+                /*truncate=*/false, /*delete_on_close=*/false,
+                /*no_buffering=*/true);
+            if (!platform::valid(direct_fd_)) {
                 std::fprintf(
                     stderr,
                     "[kvmem-io] direct_read_degraded=1 path=%s "
-                    "error=%d message=%s action=buffered-fallback\n",
-                    path_.c_str(), errno, std::strerror(errno));
+                    "message=%s action=buffered-fallback\n",
+                    path_.c_str(), platform::last_error().c_str());
             } else {
                 std::fprintf(
                     stderr,
@@ -157,100 +209,61 @@ public:
                     path_.c_str(),
                     static_cast<unsigned long long>(kDirectAlignment));
             }
-#else
-            std::fprintf(
-                stderr,
-                "[kvmem-io] direct_read_degraded=1 path=%s "
-                "error=unsupported-platform action=buffered-fallback\n",
-                path_.c_str());
-#endif
         }
         if (cfg_.preallocate && !cfg_.read_only && cfg_.total_bytes > 0) {
-            if (cfg_.total_bytes > static_cast<uint64_t>(
-                    std::numeric_limits<off_t>::max())) {
-                ::close(fd_);
-                fd_ = -1;
-                throw std::runtime_error(
-                    "NVMe KV tier preallocation exceeds off_t: " + path_);
-            }
-#if defined(__linux__)
-            int rc;
-            do {
-                rc = ::posix_fallocate(
-                    fd_, 0, static_cast<off_t>(cfg_.total_bytes));
-            } while (rc == EINTR);
-            if (rc != 0 && rc != EOPNOTSUPP && rc != ENOSYS && rc != EINVAL) {
-                ::close(fd_);
-                fd_ = -1;
+            const int rc = platform::fallocate(fd_, cfg_.total_bytes);
+            if (rc < 0) {
+                const std::string message = platform::last_error();
                 throw std::runtime_error(
                     "failed to preallocate NVMe KV tier file: " + path_ +
-                    ": " + std::strerror(rc));
+                    ": " + message);
             }
             if (rc != 0) {
                 std::fprintf(stderr,
                              "[kvmem-io] preallocate_degraded=1 path=%s "
-                             "bytes=%llu error=%d message=%s\n",
+                             "bytes=%llu action=sparse-growth-fallback\n",
                              path_.c_str(),
-                             static_cast<unsigned long long>(cfg_.total_bytes),
-                             rc, std::strerror(rc));
+                             static_cast<unsigned long long>(cfg_.total_bytes));
             } else {
                 std::fprintf(stderr,
                              "[kvmem-io] preallocated path=%s bytes=%llu\n",
                              path_.c_str(),
                              static_cast<unsigned long long>(cfg_.total_bytes));
             }
-#else
-            std::fprintf(stderr,
-                         "[kvmem-io] preallocate_degraded=1 path=%s "
-                         "bytes=%llu error=unsupported-platform\n",
-                         path_.c_str(),
-                         static_cast<unsigned long long>(cfg_.total_bytes));
-#endif
-        }
-        if (!cfg_.durable) {
-            // The backing store is an ephemeral cache, never a recoverable
-            // checkpoint. Unlink it immediately while retaining the open file
-            // descriptor: all positional I/O continues to work, but the
-            // filesystem reclaims the blocks automatically when the process
-            // closes the fd, including abnormal exits and SIGKILL. This also
-            // prevents stale kvmem_nvme.bin files from accumulating across
-            // evaluations.
-            if (::unlink(path_.c_str()) != 0) {
-                const int unlink_error = errno;
-                ::close(fd_);
-                fd_ = -1;
-                throw std::runtime_error(
-                    "failed to make NVMe KV tier file ephemeral: " + path_ +
-                    ": " + std::strerror(unlink_error));
-            }
         }
         if (cfg_.read_only && !cfg_.overlay_dir.empty()) open_overlay();
-        if (cfg_.direct_mapped) return;
+        if (cfg_.direct_mapped) {
+            guard.armed = false;
+            return;
+        }
         free_slots_.reserve(slot_count_);
         for (uint32_t i = 0; i < slot_count_; ++i) {
             free_slots_.push_back(
                 static_cast<int32_t>(slot_count_ - 1U - i));
         }
+        guard.armed = false;  // every throwing step has completed
     }
 
     NvmeKvTier(const NvmeKvTier &) = delete;
     NvmeKvTier &operator=(const NvmeKvTier &) = delete;
 
     ~NvmeKvTier() {
-        if (direct_fd_ >= 0) ::close(direct_fd_);
-        if (fd_ >= 0) ::close(fd_);
-        if (overlay_fd_ >= 0) ::close(overlay_fd_);
+        platform::close_file(direct_fd_);
+        platform::close_file(fd_);
+        platform::close_file(overlay_fd_);
     }
 
-    bool enabled() const { return fd_ >= 0 && slot_count_ > 0; }
+    bool enabled() const { return platform::valid(fd_) && slot_count_ > 0; }
     uint32_t slot_count() const { return slot_count_; }
     uint64_t slot_bytes() const { return cfg_.slot_bytes; }
     const std::string &path() const { return path_; }
     bool drops_page_cache() const { return cfg_.drop_page_cache; }
     bool direct_mapped() const { return cfg_.direct_mapped; }
-    bool read_only() const { return cfg_.read_only && overlay_fd_ < 0; }
-    bool has_overlay() const { return overlay_fd_ >= 0; }
-    bool direct_reads() const { return direct_fd_ >= 0; }
+    bool read_only() const {
+        return cfg_.read_only && !platform::valid(overlay_fd_);
+    }
+    bool has_overlay() const { return platform::valid(overlay_fd_); }
+    bool direct_reads() const { return platform::valid(direct_fd_); }
 
     // Declare block ids [begin,end) resident at their identity slots. Only
     // meaningful for a direct-mapped arena, where an attached archive knows
@@ -382,7 +395,7 @@ public:
         validate_slot_range_io(
             slot, slot_byte_offset, data, bytes, "write");
         const uint64_t offset = slot_offset(slot) + slot_byte_offset;
-        if (overlay_fd_ >= 0) {
+        if (platform::valid(overlay_fd_)) {
             write_overlay_slot_range(slot, slot_byte_offset, data, bytes);
             if (cfg_.drop_page_cache) {
                 (void) drop_cached_range(
@@ -390,7 +403,7 @@ public:
             }
             return;
         }
-        const int fd = write_fd();
+        const platform::FileHandle fd = write_fd();
         pwrite_all(fd, data, bytes, offset);
         if (cfg_.drop_page_cache) {
             (void) drop_cached_range(fd, offset, bytes, /*write=*/true);
@@ -406,7 +419,8 @@ public:
         validate_slot_range_io(
             slot, slot_byte_offset, data, bytes, "read");
         const uint64_t offset = slot_offset(slot) + slot_byte_offset;
-        const int fd = read_fd_for_range(slot, data, bytes, offset);
+        const platform::FileHandle fd =
+            read_fd_for_range(slot, data, bytes, offset);
         pread_all(fd, data, bytes, offset);
         if (cfg_.drop_page_cache && fd != direct_fd_) {
             (void) drop_cached_range(fd, offset, bytes, /*write=*/false);
@@ -431,18 +445,27 @@ public:
     }
 
 private:
+    // Reject both platforms' path separators ('/' and Windows '\\') and the
+    // "."/".." entries: file_name is appended to dir and, in ephemeral mode,
+    // POSIX-deleted - a traversal escape would write to (or delete!) an
+    // unintended path. Rejecting '\\' on POSIX is a deliberate cross-platform
+    // tightening: such names are legal there but refused so arena file names
+    // stay portable between platforms.
+    static bool is_plain_basename(const std::string &n) {
+        if (n.empty() || n == "." || n == "..") return false;
+        return n.find_first_of("/\\") == std::string::npos;
+    }
+
     static void ensure_dir(const std::string &dir) {
-        struct stat st {};
-        if (stat(dir.c_str(), &st) == 0) {
-            if ((st.st_mode & S_IFDIR) == 0) {
-                throw std::runtime_error(
-                    "NVMe KV tier path is not a directory: " + dir);
-            }
-            return;
-        }
-        if (mkdir(dir.c_str(), 0755) != 0) {
+        const int rc = platform::ensure_dir(dir);
+        if (rc == -1) {
             throw std::runtime_error(
-                "failed to create NVMe KV tier directory: " + dir);
+                "NVMe KV tier path is not a directory: " + dir);
+        }
+        if (rc == -2) {
+            throw std::runtime_error(
+                "failed to create NVMe KV tier directory: " + dir + ": " +
+                platform::last_error());
         }
     }
 
@@ -508,30 +531,24 @@ private:
 
     void open_overlay() {
         ensure_dir(cfg_.overlay_dir);
-        if (cfg_.overlay_file_name.empty() ||
-            cfg_.overlay_file_name.find('/') != std::string::npos) {
+        if (!is_plain_basename(cfg_.overlay_file_name)) {
             throw std::runtime_error(
                 "NVMe KV tier overlay_file_name must be a non-empty basename");
         }
         const std::string overlay_path =
             cfg_.overlay_dir + "/" + cfg_.overlay_file_name;
-        overlay_fd_ = ::open(overlay_path.c_str(),
-                             O_CLOEXEC | O_CREAT | O_RDWR | O_TRUNC, 0644);
-        if (overlay_fd_ < 0) {
-            throw std::runtime_error(
-                "failed to open NVMe KV tier overlay file: " + overlay_path +
-                ": " + std::strerror(errno));
-        }
         // Same rationale as the ephemeral arena: the overlay is scratch that
         // must not outlive the process, and the file stays sparse so it costs
-        // only the slots the session actually diverges on.
-        if (::unlink(overlay_path.c_str()) != 0) {
-            const int unlink_error = errno;
-            ::close(overlay_fd_);
-            overlay_fd_ = -1;
+        // only the slots the session actually diverges on. delete_on_close
+        // reproduces open-then-unlink on both platforms.
+        overlay_fd_ = platform::open_file(
+            overlay_path, /*read=*/true, /*write=*/true, /*create=*/true,
+            /*truncate=*/true, /*delete_on_close=*/true,
+            /*no_buffering=*/false);
+        if (!platform::valid(overlay_fd_)) {
             throw std::runtime_error(
-                "failed to make NVMe KV tier overlay ephemeral: " +
-                overlay_path + ": " + std::strerror(unlink_error));
+                "failed to open NVMe KV tier overlay file: " + overlay_path +
+                ": " + platform::last_error());
         }
         overlay_valid_ = std::unique_ptr<std::atomic<uint8_t>[]>(
             new std::atomic<uint8_t>[slot_count_]);
@@ -540,10 +557,12 @@ private:
         }
     }
 
-    int write_fd() const { return overlay_fd_ >= 0 ? overlay_fd_ : fd_; }
+    platform::FileHandle write_fd() const {
+        return platform::valid(overlay_fd_) ? overlay_fd_ : fd_;
+    }
 
-    int read_fd(int32_t slot) const {
-        if (overlay_fd_ < 0) return fd_;
+    platform::FileHandle read_fd(int32_t slot) const {
+        if (!platform::valid(overlay_fd_)) return fd_;
         uint8_t state = overlay_valid_[slot].load(std::memory_order_acquire);
         while (state == kOverlayInitializing) {
             std::this_thread::yield();
@@ -606,38 +625,38 @@ private:
                    slot_offset(slot) + slot_byte_offset);
     }
 
-    void pwrite_all(int fd, const void *data, uint64_t bytes,
+    void pwrite_all(platform::FileHandle fd, const void *data, uint64_t bytes,
                     uint64_t offset) const {
         const uint8_t *src = static_cast<const uint8_t *>(data);
         uint64_t done = 0;
         while (done < bytes) {
-            const ssize_t n = ::pwrite(
-                fd, src + done, static_cast<size_t>(bytes - done),
-                static_cast<off_t>(offset + done));
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) {
+            uint64_t n = 0;
+            if (!platform::transfer_at(
+                    fd, const_cast<uint8_t *>(src + done), bytes - done,
+                    offset + done, &n, /*write=*/true) || n == 0) {
                 throw std::runtime_error(
-                    "NVMe positional write failed: " +
-                    std::string(std::strerror(errno)));
+                    "NVMe positional write failed: " + platform::last_error());
             }
-            done += static_cast<uint64_t>(n);
+            done += n;
         }
     }
 
-    void pread_all(int fd, void *data, uint64_t bytes,
+    void pread_all(platform::FileHandle fd, void *data, uint64_t bytes,
                    uint64_t offset) const {
         uint8_t *dst = static_cast<uint8_t *>(data);
         uint64_t done = 0;
         while (done < bytes) {
-            const ssize_t n = ::pread(
-                fd, dst + done, static_cast<size_t>(bytes - done),
-                static_cast<off_t>(offset + done));
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) {
+            uint64_t n = 0;
+            if (!platform::transfer_at(fd, dst + done, bytes - done,
+                                       offset + done, &n, /*write=*/false)) {
+                throw std::runtime_error(
+                    "NVMe positional read failed: " + platform::last_error());
+            }
+            if (n == 0) {
                 throw std::runtime_error(
                     "NVMe positional read failed or reached unwritten data");
             }
-            done += static_cast<uint64_t>(n);
+            done += n;
         }
     }
 
@@ -652,7 +671,7 @@ private:
         // shorter than the physical record. Overlay traffic is only the live
         // suffix of an attached archive; retain coalescing for the much larger
         // immutable-base read path below.
-        if (write && overlay_fd_ >= 0) {
+        if (write && platform::valid(overlay_fd_)) {
             for (const NvmeIoSpan &span : spans) {
                 if (span.buffer_offset + span.bytes > buffer_bytes) {
                     throw std::runtime_error(
@@ -676,7 +695,7 @@ private:
                 throw std::runtime_error("NVMe batch span exceeds buffer");
             }
             const uint64_t first_file_offset = slot_offset(first.slot);
-            const int fd = write
+            const platform::FileHandle fd = write
                 ? write_fd()
                 : read_fd_for_range(
                       first.slot, base + first.buffer_offset,
@@ -740,16 +759,17 @@ private:
 
     bool direct_range_eligible(const void *data, uint64_t bytes,
                                uint64_t offset) const {
-        if (direct_fd_ < 0 || !data || bytes == 0) return false;
+        if (!platform::valid(direct_fd_) || !data || bytes == 0) return false;
         const uintptr_t address = reinterpret_cast<uintptr_t>(data);
         return address % kDirectAlignment == 0 &&
                bytes % kDirectAlignment == 0 &&
                offset % kDirectAlignment == 0;
     }
 
-    int read_fd_for_range(int32_t slot, const void *data, uint64_t bytes,
-                          uint64_t offset) const {
-        const int ordinary = read_fd(slot);
+    platform::FileHandle read_fd_for_range(int32_t slot, const void *data,
+                                           uint64_t bytes,
+                                           uint64_t offset) const {
+        const platform::FileHandle ordinary = read_fd(slot);
         // Overlay records must always use their own buffered descriptor. The
         // immutable base can use O_DIRECT only for aligned transfer slabs.
         if (ordinary == fd_ && direct_range_eligible(data, bytes, offset)) {
@@ -758,66 +778,27 @@ private:
         return ordinary;
     }
 
-    bool drop_cached_range(int fd, uint64_t offset, uint64_t bytes,
-                           bool write) const {
+    bool drop_cached_range(platform::FileHandle fd, uint64_t offset,
+                           uint64_t bytes, bool write) const {
         if (bytes == 0) return true;
-        if (write) {
-#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE) && \
-    defined(SYNC_FILE_RANGE_WAIT_BEFORE) && \
-    defined(SYNC_FILE_RANGE_WAIT_AFTER)
-            int rc;
-            do {
-                rc = ::sync_file_range(
-                    fd, static_cast<off64_t>(offset),
-                    static_cast<off64_t>(bytes),
-                    SYNC_FILE_RANGE_WAIT_BEFORE |
-                        SYNC_FILE_RANGE_WRITE |
-                        SYNC_FILE_RANGE_WAIT_AFTER);
-            } while (rc != 0 && errno == EINTR);
-            if (rc != 0) {
-                warn_cache_drop_failure("range-writeback", errno);
-                return false;
-            }
-#else
-            // Portable fallback. It flushes the whole file rather than one
-            // range, so serialize concurrent batches to avoid redundant
-            // fdatasync storms. Linux uses sync_file_range above.
-            std::lock_guard<std::mutex> lock(cache_drop_mu_);
-            int rc;
-            do {
-                rc = ::fdatasync(fd);
-            } while (rc != 0 && errno == EINTR);
-            if (rc != 0) {
-                warn_cache_drop_failure("fdatasync", errno);
-                return false;
-            }
-#endif
+        if (!platform::drop_cached_range(fd, offset, bytes, write)) {
+            warn_cache_drop_failure("page-cache-drop", platform::last_error());
+            return false;
         }
-#if defined(POSIX_FADV_DONTNEED)
-        const int advise = ::posix_fadvise(
-            fd, static_cast<off_t>(offset), static_cast<off_t>(bytes),
-            POSIX_FADV_DONTNEED);
-        if (advise != 0) {
-            warn_cache_drop_failure("posix-fadvise-dontneed", advise);
-        }
-        return advise == 0;
-#else
-        (void) offset;
-        warn_cache_drop_failure("posix-fadvise-unavailable", ENOTSUP);
-        return false;
-#endif
+        return true;
     }
 
-    void warn_cache_drop_failure(const char *phase, int error) const {
+    void warn_cache_drop_failure(const char *phase,
+                                 const std::string &error) const {
         bool expected = false;
         if (!cache_drop_warned_.compare_exchange_strong(expected, true)) {
             return;
         }
         std::fprintf(
             stderr,
-            "[kvmem-io] page_cache_drop_degraded=1 phase=%s error=%d "
-            "message=%s action=continue-with-kernel-page-cache\n",
-            phase, error, std::strerror(error));
+            "[kvmem-io] page_cache_drop_degraded=1 phase=%s message=%s "
+            "action=continue-with-kernel-page-cache\n",
+            phase, error.c_str());
     }
 
     void touch_locked(uint32_t block_id) {
@@ -842,15 +823,14 @@ private:
     static constexpr uint64_t kDirectAlignment = 4096;
     uint32_t slot_count_ = 0;
     std::string path_;
-    int fd_ = -1;
-    int direct_fd_ = -1;
-    int overlay_fd_ = -1;
+    platform::FileHandle fd_ = platform::invalid_handle();
+    platform::FileHandle direct_fd_ = platform::invalid_handle();
+    platform::FileHandle overlay_fd_ = platform::invalid_handle();
     static constexpr uint8_t kOverlayBase = 0;
     static constexpr uint8_t kOverlayInitializing = 1;
     static constexpr uint8_t kOverlayValid = 2;
     std::unique_ptr<std::atomic<uint8_t>[]> overlay_valid_;
     mutable std::mutex meta_mu_;
-    mutable std::mutex cache_drop_mu_;
     mutable std::atomic<bool> cache_drop_warned_{false};
     std::vector<int32_t> free_slots_;
     std::unordered_map<uint32_t, int32_t> block_to_slot_;

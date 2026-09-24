@@ -92,7 +92,21 @@ static void test_sum_only(uint32_t block_tokens) {
     CHECK(raw.bytes_k() == 0 && !raw.has_block(0));
 }
 
+static int test_main();
+
 int main() {
+    // Unbuffered + top-level catch so failures leave diagnostics instead of
+    // an opaque 0xC0000409 (uncaught exception -> terminate).
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    try {
+        return test_main();
+    } catch (const std::exception & e) {
+        std::printf("EXCEPTION: %s\n", e.what());
+        return 2;
+    }
+}
+
+static int test_main() {
     test_sum_only(32);
     test_sum_only(128);
     kvmem::RawKvStoreConfig cfg;
@@ -170,7 +184,7 @@ int main() {
 
 #if KVMEM_ENABLE_NVME
     kvmem::RawKvStoreConfig ncfg = cfg;
-    ncfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_k_test").string();
+    ncfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_k_test").u8string();
     ncfg.nvme_file = "raw.bin";
     ncfg.nvme_bytes = 4ull * 1024ull * 1024ull;
     kvmem::RawKvStore rawn(ncfg);
@@ -280,7 +294,7 @@ int main() {
 
     kvmem::RawKvStoreConfig ngcfg = cfg;
     ngcfg.v_gpu_row_bytes = 6;
-    ngcfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_vgpu_test").string();
+    ngcfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_vgpu_test").u8string();
     ngcfg.nvme_file = "raw_vgpu.bin";
     ngcfg.nvme_bytes = 4ull * 1024ull * 1024ull;
     std::vector<uint8_t> packed4(24);
@@ -317,7 +331,7 @@ int main() {
 #if KVMEM_ENABLE_NVME
     kvmem::RawKvStoreConfig nkcfg = cfg;
     nkcfg.k_row_bytes = 6;
-    nkcfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_krow_test").string();
+    nkcfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_krow_test").u8string();
     nkcfg.nvme_file = "raw_krow.bin";
     nkcfg.nvme_bytes = 4ull * 1024ull * 1024ull;
     kvmem::RawKvStore rawkn(nkcfg);
@@ -345,6 +359,11 @@ int main() {
         if (nvme && !KVMEM_ENABLE_NVME) continue;
         auto tail_cfg = ngcfg;
         tail_cfg.k_gpu_row_bytes = 6;
+        // Independent arena file. Windows: a POSIX-deleted (delete-pending)
+        // name cannot be recreated while any handle to it is still open; a
+        // distinct name keeps this loop order-independent of earlier arena
+        // lifetimes. POSIX: a distinct name is trivially equivalent.
+        tail_cfg.nvme_file = "raw_vgpu_tail.bin";
         if (!nvme) tail_cfg.nvme_bytes = 0;
         kvmem::RawKvStore tail_store(tail_cfg);
         tail_store.write_layer_mean_k(0, 2, 0, k.data());

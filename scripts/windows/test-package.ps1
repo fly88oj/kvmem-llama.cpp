@@ -22,7 +22,7 @@ try {
     foreach ($name in 'llama-kvmem-server.exe', 'llama-kvmem-cli.exe', 'llama-quantize.exe') {
         Copy-Item -LiteralPath $TestExe -Destination (Join-Path $build "bin/$name")
     }
-    [IO.File]::WriteAllText((Join-Path $build 'CMakeCache.txt'), "KVMEM_ENABLE_NVME:BOOL=OFF`nCMAKE_BUILD_TYPE:STRING=Release`nGGML_CUDA:BOOL=OFF`n")
+    [IO.File]::WriteAllText((Join-Path $build 'CMakeCache.txt'), "KVMEM_ENABLE_NVME:BOOL=ON`nCMAKE_BUILD_TYPE:STRING=Release`nGGML_CUDA:BOOL=OFF`n")
     $files = @{}
     foreach ($file in Get-ChildItem -LiteralPath $source -Recurse -File) {
         $files[$file.FullName.Substring($source.Length + 1).Replace('\', '/')] = (Get-FileHash $file.FullName).Hash
@@ -41,7 +41,7 @@ try {
         Check ((Get-FileHash -LiteralPath (Join-Path $package $name)).Hash -ieq $hash) "checksum mismatch: $name"
     }
     $info = Get-Content -LiteralPath (Join-Path $package 'BUILD-INFO.json') -Raw | ConvertFrom-Json
-    Check (!$info.nvme_supported) 'incorrect NVMe capability'
+    Check ($info.nvme_supported) 'incorrect NVMe capability'
     Check ($info.source_archive_sha256 -ieq (Get-FileHash $archive).Hash) 'source hash'
     $options.OutputDir = Join-Path $temp 'quantizer'
     $options.Component = 'Quantizer'

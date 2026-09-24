@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <vector>
 
@@ -116,7 +117,8 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
         rcfg.nvme_bytes = need + 32ull * 1024ull * 1024ull;
         rcfg.nvme_dir = (kp->nvme_dir && kp->nvme_dir[0])
                 ? kp->nvme_dir
-                : "/tmp/kvmem_nvme";
+                : (std::filesystem::temp_directory_path() / "kvmem_nvme")
+                          .u8string();
         rcfg.nvme_file = "kvmem_raw_mtp_k.bin";
     }
     raw_ = std::make_unique<kvmem::RawKvStore>(rcfg);

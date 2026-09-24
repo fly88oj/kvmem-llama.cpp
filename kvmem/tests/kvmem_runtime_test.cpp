@@ -165,7 +165,7 @@ static void test_cpu_full_spills_to_nvme_and_roundtrips() {
         }
     };
 
-    const std::string dir = (std::filesystem::temp_directory_path() / "kvmem_p32_nvme").string();
+    const std::string dir = (std::filesystem::temp_directory_path() / "kvmem_p32_nvme").u8string();
 
     MemoryBackend be;
     KvMemRuntimeConfig cfg = make_cfg();

@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -310,7 +311,10 @@ static kvmem::KvMemRuntimeConfig make_runtime_cfg(
         if (g_kvmem_params.nvme_dir && g_kvmem_params.nvme_dir[0]) {
             cfg.nvme_dir = g_kvmem_params.nvme_dir;
         } else if (cfg.nvme_bytes > 0) {
-            cfg.nvme_dir = "/tmp/kvmem_nvme";
+            // Portable default (was /tmp/kvmem_nvme; %TEMP% on Windows).
+            // u8string: the platform layer decodes UTF-8 deterministically.
+            cfg.nvme_dir = (std::filesystem::temp_directory_path() /
+                            "kvmem_nvme").u8string();
         }
     }
     return cfg;
@@ -569,7 +573,8 @@ llama_memory_kvmem::llama_memory_kvmem(
                 : (32ull * 1024ull * 1024ull * 1024ull);
         rcfg.nvme_dir = (g_kvmem_params.nvme_dir && g_kvmem_params.nvme_dir[0])
                 ? g_kvmem_params.nvme_dir
-                : "/tmp/kvmem_nvme";
+                : (std::filesystem::temp_directory_path() / "kvmem_nvme")
+                          .u8string();
         rcfg.nvme_file = "kvmem_raw_k.bin";
     }
     raw_ = std::make_unique<kvmem::RawKvStore>(rcfg);

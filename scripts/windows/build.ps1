@@ -8,7 +8,8 @@ param(
     [string]$CudaArchitectures = '75-real;80-real;86-real;89-real;90-real;120a-real',
     [ValidateRange(1, 64)][int]$Jobs = 4,
     [switch]$HostOnly,
-    [switch]$BuildOnly
+    [switch]$BuildOnly,
+    [switch]$DisableNvme
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -48,9 +49,11 @@ if (!$HostOnly) {
         Invoke-Checked git @('-C', $llama, 'apply', $patch)
     }
 }
+$nvmeDefine = if ($DisableNvme) { '-DKVMEM_ENABLE_NVME=OFF' } else { '-DKVMEM_ENABLE_NVME=ON' }
+$nvmeTest = if ($DisableNvme) { 'nvme_disabled_test' } else { 'nvme_kv_tier_test' }
 $options = @('-S', $SourceDir, '-B', $BuildDir, '-G', 'Ninja',
     '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CXX_COMPILER=cl',
-    '-DBUILD_SHARED_LIBS=OFF', '-DKVMEM_ENABLE_NVME=OFF')
+    '-DBUILD_SHARED_LIBS=OFF', $nvmeDefine)
 if (!$HostOnly) {
     $options += @('-DCMAKE_C_COMPILER=cl', '-DGGML_BACKEND_DL=OFF',
     '-DGGML_NATIVE=OFF', '-DGGML_AVX=ON', '-DGGML_AVX2=ON', '-DGGML_FMA=ON',
@@ -77,7 +80,7 @@ if ($HostOnly) {
         "-DCMAKE_CUDA_COMPILER=$CudaPath/bin/nvcc.exe", "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures")
 }
 Invoke-Checked cmake $options
-$targets = @('kvmem_store_test', 'pinned_kv_tier_test', 'nvme_disabled_test', 'kvmem_runtime_test', 'raw_kv_store_test')
+$targets = @('kvmem_store_test', 'pinned_kv_tier_test', $nvmeTest, 'kvmem_runtime_test', 'raw_kv_store_test')
 if (!$HostOnly) {
     $targets += @('llama-kvmem-server', 'llama-kvmem-cli', 'llama-quantize',
         'kvmem-chat-id-test', 'kvmem-reasoning-budget-test', 'kvmem-chat-template-test', 'kvmem-server-options-test',
@@ -86,6 +89,6 @@ if (!$HostOnly) {
 Invoke-Checked cmake (@('--build', $BuildDir, '--parallel', "$Jobs", '--target') + $targets)
 if (!$BuildOnly) {
     Invoke-Checked ctest @('--test-dir', $BuildDir, '--output-on-failure', '-R',
-        '^(kvmem_store_test|pinned_kv_tier_test|nvme_disabled_test|kvmem_runtime_test|raw_kv_store_test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test)$')
+        "^(kvmem_store_test|pinned_kv_tier_test|$nvmeTest|kvmem_runtime_test|raw_kv_store_test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test)$")
     Write-Host "Built and tested: $BuildDir"
 } else { Write-Host "Built only; runtime tests NOT run: $BuildDir" }

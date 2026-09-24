@@ -1,19 +1,17 @@
-if (WIN32)
-    set(KVMEM_NVME_DEFAULT OFF)
-else()
-    set(KVMEM_NVME_DEFAULT ON)
-endif()
-option(KVMEM_ENABLE_NVME "Build the POSIX NVMe KV storage tier" ${KVMEM_NVME_DEFAULT})
-if (WIN32 AND KVMEM_ENABLE_NVME)
-    message(FATAL_ERROR "NVMe storage is not supported on Windows; use KVMEM_ENABLE_NVME=OFF")
-endif()
+option(KVMEM_ENABLE_NVME "Build the NVMe/SSD KV storage tier (POSIX and Win32)" ON)
 
-add_library(kvmem
+set(KVMEM_SOURCES
     src/host/kvmem_store.cpp
     src/host/kvmem_runtime.cpp
     src/host/raw_kv_store.cpp
     src/host/rope.cpp
 )
+if (KVMEM_ENABLE_NVME)
+    # Platform I/O primitives for the NVMe tier; only compiled when the tier
+    # is enabled (an all-guarded TU would trigger MSVC LNK4221).
+    list(APPEND KVMEM_SOURCES src/host/nvme_platform.cpp)
+endif()
+add_library(kvmem ${KVMEM_SOURCES})
 set_target_properties(kvmem PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(kvmem PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(kvmem PUBLIC cxx_std_17)

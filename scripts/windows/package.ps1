@@ -32,7 +32,7 @@ foreach ($entry in $manifest.files.PSObject.Properties) {
     }
 }
 $cache = Get-Content -LiteralPath (Join-Path $BuildDir 'CMakeCache.txt') -Raw
-if ($cache -notmatch '(?m)^KVMEM_ENABLE_NVME:BOOL=OFF\r?$') { throw 'Expected an NVMe-disabled build' }
+if ($cache -notmatch '(?m)^KVMEM_ENABLE_NVME:BOOL=ON\r?$') { throw 'Expected an NVMe-enabled build' }
 if ($cache -notmatch '(?m)^CMAKE_BUILD_TYPE:STRING=Release\r?$') { throw 'Expected a Release build' }
 $cuda = $cache -match '(?m)^GGML_CUDA:BOOL=ON\r?$'
 if ($cuda) {
@@ -126,7 +126,7 @@ foreach ($line in $cache.Split([char]10)) {
 $info = @{ component = $Component; status = 'experimental-windows-build'; version = (Get-Content (Join-Path $SourceDir 'VERSION') -Raw).Trim();
     source_archive_sha256 = (Get-FileHash -LiteralPath $SourceArchive -Algorithm SHA256).Hash.ToLowerInvariant();
     source_manifest_sha256 = (Get-FileHash -LiteralPath $SourceManifest -Algorithm SHA256).Hash.ToLowerInvariant();
-    build_options = $options; nvme_supported = $false; models_included = $false;
+    build_options = $options; nvme_supported = $true; models_included = $false;
     msvc_toolset = $env:VCToolsVersion; os_version = [Environment]::OSVersion.VersionString;
     cpu_requirement = 'x86_64 with AVX2, FMA, F16C and BMI2';
     external_msvc_runtime_dlls = @($runtimeDlls); gpu_runtime_validation = 'not certified by packaging' }

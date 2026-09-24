@@ -4,11 +4,17 @@
 
 **QQ community / QQ 交流群：1040777853**
 
+> **AMD GPU (HIP/ROCm) port.** This tree adds a native AMD backend, validated on
+> Radeon RX 9070 XT (gfx1201) on Windows. See
+> [docs/amd-hip-port.md](docs/amd-hip-port.md) ([中文](docs/amd-hip-port.zh-CN.md))
+> for prerequisites, build, run, benchmarks and troubleshooting. The rest of this
+> README documents the original CUDA setup.
+
 ## Near-lossless Qwen3.8-27B at a full 256K workspace on 16 GiB VRAM
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
-**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [llama.cpp](https://github.com/ggml-org/llama.cpp). llama.cpp handles model loading, inference, quantization and MTP. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. **NVMe offload is not implemented.**
+**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [llama.cpp](https://github.com/ggml-org/llama.cpp). llama.cpp handles model loading, inference, quantization and MTP. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. Evicted history can spill to an **NVMe/SSD tier** (`--kvmem-nvme-gb`) on both POSIX and Windows; it is a cold-history capacity tier, not a throughput accelerator (see [docs/kvmem-nvme-disk-tier-windows.md](docs/kvmem-nvme-disk-tier-windows.md)).
 
 This port supports **Qwen3.8-27B GGUF quants**, including IQ3 and IQ4. The sibling [kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native runtime focused on Q8, primarily tested on RTX PRO 6000.
 
@@ -60,7 +66,7 @@ Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the
 - RTX 5060 Ti with 16 GiB VRAM; Intel Core Ultra 7 255H and 32 GiB RAM (19.53 GiB visible to WSL2).
 - CMake 4.4.3 and CUDA 13.2.86.
 
-The project builds on llama.cpp's CUDA backend, with the platform above used for our measurements. Reports of successful runs, benchmarks and issues on other NVIDIA GPUs and systems are welcome. AMD/ROCm and Metal backends would need integration work.
+The project builds on llama.cpp's CUDA backend, with the platform above used for our measurements. Reports of successful runs, benchmarks and issues on other NVIDIA GPUs and systems are welcome. **AMD GPUs are supported through a HIP/ROCm port** validated on Radeon RX 9070 XT (gfx1201), native Windows — see [docs/amd-hip-port.md](docs/amd-hip-port.md) ([中文](docs/amd-hip-port.zh-CN.md)). The Metal backend would still need integration work.
 
 ## Prebuilt downloads
 
@@ -93,7 +99,7 @@ Building uses a C++17 compiler, CMake and **CUDA Toolkit 13.2 Update 2 (nvcc 13.
 
 Check `nvcc --version` for the compiler selected by CMake; `release 13.2` alone is insufficient, and the CUDA version shown by `nvidia-smi` describes driver support. After upgrading the Toolkit, configure a **new build directory** and rebuild the binaries. Updating the driver or replacing CUDA DLLs does not fix CUDA kernels already compiled into an old binary.
 
-An experimental [native Windows build](scripts/windows/README.md) is being validated. It disables NVMe storage and includes PowerShell launchers; the performance results below remain Linux/WSL2 measurements.
+An experimental [native Windows build](scripts/windows/README.md) is being validated. It enables the NVMe/SSD spill tier by default (`build.ps1 -DisableNvme` turns it off) and includes PowerShell launchers; the performance results below remain Linux/WSL2 measurements.
 
 ```bash
 git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
@@ -489,6 +495,8 @@ Native TLS is not supported. Stream `usage` includes
 - [v0.16.0-rc3 milestone](docs/milestones/v0.16.0-rc3.md)
 - [Modification plan](docs/modification-plan.md)
 - [Architecture](docs/architecture.md)
+- [AMD HIP/ROCm port](docs/amd-hip-port.md) ([中文](docs/amd-hip-port.zh-CN.md))
+- [KVMem disk (NVMe) spill tier on Windows — plan](docs/kvmem-nvme-disk-tier-windows.md)
 - [Patch replay](patches/README.md)
 - [Recommended 16 GiB performance](docs/recommended-config-performance.md)
 - [256K tool benchmark](docs/long-context-benchmark-2026-09-14.md)
@@ -502,9 +510,10 @@ Native TLS is not supported. Stream `usage` includes
 kvmem/            Host KVMem library (no llama.cpp includes)
 src/adapter/      llama_memory_i wrapper
 tools/            llama-kvmem-cli, llama-kvmem-server, vision helpers
-scripts/          apply-patches, CUDA build, GPU bind, start helpers
+scripts/          apply-patches, CUDA/HIP build, GPU bind, start helpers
+compat/hipify/    CUDA->HIP symbol/header shims for the AMD port
 patches/          Diffs against the llama.cpp pin
-docs/             Architecture, milestones, multimodal
+docs/             Architecture, milestones, multimodal, AMD HIP port
 llama.cpp/        Submodule (pin only; apply patches after clone)
 models/           Local GGUFs (gitignored)
 ```

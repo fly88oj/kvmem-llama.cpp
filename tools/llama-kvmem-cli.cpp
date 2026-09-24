@@ -41,7 +41,7 @@ static void print_usage(const char * argv0) {
             "  --kvmem-gpu-low R          prefill offload low watermark (default 0.85)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe spill file in GiB (0 = off)\n"
-            "  --kvmem-nvme-dir PATH      NVMe spill directory (default /tmp/kvmem_nvme)\n"
+            "  --kvmem-nvme-dir PATH      NVMe spill directory (default: <system temp>/kvmem_nvme)\n"
             "  --kvmem-harvest-v          prefill D2H V with raw-K (default off; RAM until NVMe flush)\n"
             "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
             "  --kvmem-dump-kv            after prefill, compare raw-rebuild KV vs GPU KV\n"
