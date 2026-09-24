@@ -18,6 +18,13 @@ The numbered `0001` through `0004` files are historical patches, retained for
 reference. They are superseded by the cumulative diff: the old series did
 not cleanly replay on the current pin and must not be applied together with it.
 
+`kvmem-hip-port-cmake.patch` is the AMD/HIP delta: it adds only the `GGML_HIP`
+branch to `llama.cpp/src/CMakeLists.txt` and applies **on top of** the cumulative
+patch (the cumulative patch itself is backend-agnostic and HIP-free).
+`scripts/windows/build-hip.ps1` applies both in order; regenerate the delta with
+`python scripts/windows/emit-hip-patch.py` after editing that CMakeLists. See
+[docs/amd-hip-port.md](../docs/amd-hip-port.md).
+
 To check a clean extraction without changing the active submodule:
 
 ```bash

@@ -1,0 +1,48 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -67,6 +67,9 @@
+     if (LLAMA_KVMEM_ROOT STREQUAL "")
+         message(FATAL_ERROR "LLAMA_KVMEM=ON requires LLAMA_KVMEM_ROOT")
+     endif()
++    if (GGML_CUDA AND GGML_HIP)
++        message(FATAL_ERROR "LLAMA_KVMEM: GGML_CUDA and GGML_HIP are mutually exclusive")
++    endif()
+     target_sources(llama PRIVATE
+         ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem.cpp
+         ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem-hybrid.cpp
+@@ -82,6 +85,25 @@
+             set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
+         endif()
+     endif()
++    # KVMem AMD/HIP port: same stage-in kernels compiled for GCN/RDNA by the
++    # ROCm toolchain. Mirrors how ggml/src/ggml-hip rebuilds ../ggml-cuda/*.cu
++    # (LANGUAGE CXX + hip::device on Windows where CMake has no HIP language;
++    # native LANGUAGE HIP elsewhere). compat/hipify maps the CUDA API names
++    # used by the adapter onto HIP (see header for scope).
++    if (GGML_HIP)
++        find_package(hip REQUIRED)
++        set(KVMEM_STAGEIN_CU ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-stagein.cu)
++        target_sources(llama PRIVATE ${KVMEM_STAGEIN_CU})
++        if (WIN32)
++            set_source_files_properties(${KVMEM_STAGEIN_CU} PROPERTIES LANGUAGE CXX)
++        else()
++            enable_language(HIP)
++            set_source_files_properties(${KVMEM_STAGEIN_CU} PROPERTIES LANGUAGE HIP)
++        endif()
++        target_include_directories(llama PRIVATE ${LLAMA_KVMEM_ROOT}/compat/hipify)
++        target_compile_definitions(llama PRIVATE GGML_USE_HIP)
++        target_link_libraries(llama PRIVATE hip::device)
++    endif()
+     target_include_directories(llama PRIVATE
+         ${LLAMA_KVMEM_ROOT}/kvmem/include
+         ${LLAMA_KVMEM_ROOT}/src/adapter
+@@ -93,7 +115,7 @@
+     endif()
+     target_link_libraries(llama PRIVATE kvmem)
+     find_package(CUDAToolkit QUIET)
+-    if (CUDAToolkit_FOUND)
++    if (CUDAToolkit_FOUND AND NOT GGML_HIP)
+         target_link_libraries(llama PRIVATE CUDA::cudart)
+     endif()
+ endif()
