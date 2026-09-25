@@ -240,15 +240,95 @@ static bool kvmem_env_perf() {
     return v == 1;
 }
 
+// Hosts that speak the --kvmem-* CLI (llama-kvmem-cli / llama-kvmem-server)
+// always call llama_kvmem_set_params(); that flag keeps their explicit CLI
+// arguments authoritative. A host that never calls set_params (e.g. the stock
+// llama-server inside an LM Studio runtime pack) falls back to KVMEM_* env
+// vars, read once on first get_params(): the host process inherits the user
+// environment, so the full feature set stays configurable without CLI flags.
+static bool g_kvmem_params_from_cli = false;
+
+static void kvmem_env_str(const char * name, const char * & out) {
+    const char * e = getenv(name);
+    if (e && e[0] != '\0') {
+        out = e;  // env storage is stable for the process lifetime
+    }
+}
+
+static void kvmem_apply_env(void) {
+    const char * en = getenv("KVMEM_ENABLE");
+    if (!(en && en[0] != '\0' && en[0] != '0')) {
+        return;
+    }
+    g_kvmem_params.enabled = true;
+
+    auto env_u32 = [](const char * name, uint32_t & out) {
+        const char * e = getenv(name);
+        if (e && e[0] != '\0') {
+            out = (uint32_t) strtoul(e, nullptr, 10);
+        }
+    };
+    env_u32("KVMEM_BLOCK_TOKENS", g_kvmem_params.block_tokens);
+    env_u32("KVMEM_BUDGET", g_kvmem_params.budget);
+    env_u32("KVMEM_GEN_RESERVE", g_kvmem_params.gen_reserve);
+    env_u32("KVMEM_SINK_TOKENS", g_kvmem_params.sink_tokens);
+    env_u32("KVMEM_RECENT_TOKENS", g_kvmem_params.recent_tokens);
+
+    const char * m = getenv("KVMEM_METHOD");
+    if (m && m[0]) {
+        g_kvmem_params.method =
+            (strcmp(m, "recency") == 0 || strcmp(m, "0") == 0) ? 0 : 1;
+    } else {
+        g_kvmem_params.method = 1;  // match the CLI default
+    }
+
+    auto env_f32 = [](const char * name, float & out) {
+        const char * e = getenv(name);
+        if (e && e[0] != '\0') {
+            out = (float) strtod(e, nullptr);
+        }
+    };
+    env_f32("KVMEM_GPU_RATIO", g_kvmem_params.gpu_memory_ratio);
+    env_f32("KVMEM_GPU_HIGH", g_kvmem_params.gpu_high_watermark);
+    env_f32("KVMEM_GPU_LOW", g_kvmem_params.gpu_low_watermark);
+
+    double gb;
+    const char * e = getenv("KVMEM_CPU_GB");
+    if (e && e[0] && (gb = strtod(e, nullptr)) > 0.0) {
+        g_kvmem_params.cpu_bytes = (uint64_t) (gb * 1073741824.0);
+    }
+    e = getenv("KVMEM_NVME_GB");
+    if (e && e[0] && (gb = strtod(e, nullptr)) > 0.0) {
+        g_kvmem_params.nvme_bytes = (uint64_t) (gb * 1073741824.0);
+    }
+    kvmem_env_str("KVMEM_NVME_DIR", g_kvmem_params.nvme_dir);
+
+    e = getenv("KVMEM_HARVEST_V");
+    g_kvmem_params.harvest_v = e && e[0] && e[0] != '0';
+    e = getenv("KVMEM_RAW_K_NVME");
+    g_kvmem_params.raw_k_nvme = e && e[0] && e[0] != '0';
+    e = getenv("KVMEM_MTP_STATE");
+    if (e && e[0]) {
+        g_kvmem_params.mtp_state = atoi(e);
+    }
+
+    LLAMA_LOG_INFO("%s: KVMem configured from KVMEM_* environment (host has no --kvmem CLI)\n", __func__);
+}
+
 void llama_kvmem_set_params(const struct llama_kvmem_params * params) {
     if (params) {
         g_kvmem_params = *params;
     } else {
         g_kvmem_params = {};
     }
+    g_kvmem_params_from_cli = true;
 }
 
 const struct llama_kvmem_params * llama_kvmem_get_params(void) {
+    if (!g_kvmem_params_from_cli) {
+        g_kvmem_params_from_cli = true;  // apply env once per process
+        kvmem_apply_env();
+    }
     return &g_kvmem_params;
 }
 

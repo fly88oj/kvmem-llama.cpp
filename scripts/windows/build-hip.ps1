@@ -16,6 +16,10 @@
 
 param(
     [string]$GpuTarget = 'gfx1201',
+    # LM Studio runtime pack build: shared llama/ggml libraries with dynamic
+    # backend dlls (ggml-base/cpu/hip split), matching the file set in
+    # engine-protocol-server-artifacts.json. Used by make-lms-extension.ps1.
+    [switch]$LmsShared,
     [string]$BuildDir  = 'build-hip',
     [string]$RocmRoot  = '',
     [int]$Jobs         = [math]::Min(16, [Environment]::ProcessorCount),  # 16C/32T sweet spot: clang HIP TUs peak ~2 GB each, 16x2<47 GB RAM
@@ -137,6 +141,18 @@ if ($HostOnly) {
         '-DCMAKE_C_FLAGS=-Wno-error=incompatible-pointer-types -DKVMEM_HIP_SKIP_MATH_FWD',
         '-DCMAKE_CXX_FLAGS=-DKVMEM_HIP_SKIP_MATH_FWD'
     )
+    if ($LmsShared) {
+        # Shared tree for the LM Studio extension pack (see artifacts list:
+        # llama.dll llama-common.dll llama-server-impl.dll ggml-*.dll mtmd.dll).
+        # GGML_BACKEND_DL stays OFF: one unified ggml.dll — the adapter's direct
+        # calls into CUDA/HIP backend entry points (gdn_fold) are not resolvable
+        # across plugin-dll boundaries. The official per-backend dlls remain in
+        # the pack untouched (LM Studio engine layer reads them if it must).
+        $cmakeArgs += @('-DBUILD_SHARED_LIBS=ON', '-DGGML_BACKEND_DL=OFF',
+                        '-DLLAMA_BUILD_TESTS=OFF', '-DLLAMA_BUILD_EXAMPLES=OFF',
+                        '-DLLAMA_BUILD_TOOLS=ON', '-DLLAMA_BUILD_SERVER=ON',
+                        '-DLLAMA_BUILD_APP=ON')
+    }
     $env:HIP_PLATFORM = 'amd'
     $env:HSA_OVERRIDE_GFX_VERSION = $null   # unsupported on Windows; gfx1201 is real
 }
@@ -144,12 +160,21 @@ if ($HostOnly) {
 if ($LASTEXITCODE -ne 0) { throw 'cmake configure failed' }
 
 # --- build ---
-& $cmakeBin --build $BuildDir --config Release --parallel $Jobs
+if ($LmsShared) {
+    # Whitelist targets: KVMem's own test exes use llama-internal C++ classes
+    # that a shared llama.dll does not export (fine for the static tree, not
+    # for this one) — the LM Studio pack only needs the artifact targets below.
+    & $cmakeBin --build $BuildDir --config Release --parallel $Jobs --target llama llama-common llama-server mtmd
+} else {
+    & $cmakeBin --build $BuildDir --config Release --parallel $Jobs
+}
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
 # --- model-free tests ---
-& $ctestBin --test-dir $BuildDir -C Release --output-on-failure
-if ($LASTEXITCODE -ne 0) { Write-Warning 'ctest reported failures — inspect before GPU validation.' }
+if (-not $LmsShared) {
+    & $ctestBin --test-dir $BuildDir -C Release --output-on-failure
+    if ($LASTEXITCODE -ne 0) { Write-Warning 'ctest reported failures — inspect before GPU validation.' }
+}
 
 # --- stage HIP runtime DLLs next to the binaries ---
 # Adrenalin ships an amdhip64_7.dll in System32 that the loader finds before

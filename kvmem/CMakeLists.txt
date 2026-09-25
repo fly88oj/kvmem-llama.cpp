@@ -11,7 +11,10 @@ if (KVMEM_ENABLE_NVME)
     # is enabled (an all-guarded TU would trigger MSVC LNK4221).
     list(APPEND KVMEM_SOURCES src/host/nvme_platform.cpp)
 endif()
-add_library(kvmem ${KVMEM_SOURCES})
+# STATIC by design: in a BUILD_SHARED_LIBS=ON tree (LM Studio pack), an
+# unexported Windows SHARED lib would strand its symbols away from llama.dll;
+# static gets absorbed into llama.dll at link.
+add_library(kvmem STATIC ${KVMEM_SOURCES})
 set_target_properties(kvmem PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(kvmem PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(kvmem PUBLIC cxx_std_17)
