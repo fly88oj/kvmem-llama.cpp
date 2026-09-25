@@ -332,10 +332,20 @@ static bool kvmem_cache_has_layer(const llama_kv_cache * kv, int32_t il) {
     return false;
 }
 
+// A layer is slot-pool MANAGED only if it is attention-based, not a sliding
+// window layer, and actually owns a KV cache (gemma KV-sharing layers reuse
+// an earlier layer's cache and must not inflate the slot layout).
+static bool kvmem_layer_is_managed(const llama_model & model, uint32_t il) {
+    return !model.hparams.is_recr(il) && !model.hparams.is_swa(il) &&
+           model.hparams.has_kv(il);
+}
+
 static uint32_t kvmem_first_attn_layer(const llama_model & model) {
+    // First MANAGED attention layer (see kvmem_layer_is_managed). The
+    // slot-pool layout takes its K/V geometry from this layer.
     const uint32_t n = model.hparams.n_layer();
     for (uint32_t il = 0; il < n; ++il) {
-        if (!model.hparams.is_recr(il)) {
+        if (kvmem_layer_is_managed(model, il)) {
             return il;
         }
     }
@@ -343,14 +353,46 @@ static uint32_t kvmem_first_attn_layer(const llama_model & model) {
 }
 
 static uint32_t kvmem_n_attn_layers(const llama_model & model) {
+    // Count of MANAGED attention layers (see kvmem_layer_is_managed).
     const uint32_t n = model.hparams.n_layer();
     uint32_t c = 0;
     for (uint32_t il = 0; il < n; ++il) {
-        if (!model.hparams.is_recr(il)) {
+        if (kvmem_layer_is_managed(model, il)) {
             ++c;
         }
     }
     return c == 0 ? n : c;
+}
+
+static bool kvmem_managed_geometry_uniform(const llama_model & model) {
+    // The slot layout uses one K/V row size for all managed layers; refuse
+    // models whose managed layers disagree (would silently mis-copy).
+    const uint32_t n = model.hparams.n_layer();
+    uint32_t k0 = 0, v0 = 0;
+    bool have = false;
+    for (uint32_t il = 0; il < n; ++il) {
+        if (!kvmem_layer_is_managed(model, il)) {
+            continue;
+        }
+        const uint32_t k = model.hparams.n_embd_k_gqa(il);
+        const uint32_t v = model.hparams.n_embd_v_gqa(il);
+        if (!have) {
+            k0 = k; v0 = v; have = true;
+        } else if (k != k0 || v != v0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_memory_kvmem::layer_managed(int32_t il) const {
+    if (il < 0 || static_cast<uint32_t>(il) >= model_.hparams.n_layer()) {
+        return false;
+    }
+    const uint32_t u = static_cast<uint32_t>(il);
+    return kvmem_cache_has_layer(kv_, il) &&
+           !model_.hparams.is_recr(u) &&
+           !model_.hparams.is_swa(u);
 }
 
 struct kvmem_pool_plan {
@@ -454,6 +496,14 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
             }
         }
         if (!tgt) {
+            if (cparams.ctx_other && dynamic_cast<const llama_memory_kvmem_swa *>(
+                    llama_get_memory(cparams.ctx_other))) {
+                // Stock draft creation would wire the assistant share-callback
+                // straight onto the SWA target's slot-pooled base cache and
+                // write through it uncoordinated. Reject loudly instead.
+                LLAMA_LOG_ERROR("%s: KVMem MTP draft over a SWA slot-pool target is not supported"
+                        " - disable KVMem for this pairing\n", __func__);
+            }
             return nullptr;
         }
         return new llama_memory_kvmem_mtp(model, params, cparams, tgt);
@@ -468,9 +518,32 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
                 __func__, cparams.n_seq_max);
         return nullptr;
     }
-    if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        LLAMA_LOG_WARN("%s: KVMem skips SWA models\n", __func__);
+    if (!kvmem_managed_geometry_uniform(model)) {
+        LLAMA_LOG_WARN("%s: KVMem skips models with non-uniform managed-layer KV geometry\n", __func__);
         return nullptr;
+    }
+    if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        if (llm_arch_is_hybrid(model.arch)) {
+            LLAMA_LOG_WARN("%s: KVMem skips SWA+recurrent hybrid models\n", __func__);
+            return nullptr;
+        }
+        bool any_managed = false;
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            if (kvmem_layer_is_managed(model, il)) {
+                any_managed = true;
+                break;
+            }
+        }
+        if (!any_managed) {
+            LLAMA_LOG_WARN("%s: KVMem skips fully-SWA models (no dense layers to manage)\n", __func__);
+            return nullptr;
+        }
+        // gemma3/gemma4-style interleaved SWA: the dense/global layers become
+        // a KVMem slot-pool (the iswa base cache, uniform geometry); the SWA
+        // layers keep the stock rolling window (the iswa swa cache). A single
+        // mixed-geometry cache is NOT viable (kv_cache rope/uniformity
+        // assumptions break during graph reserve).
+        return new llama_memory_kvmem_swa(model, params, cparams);
     }
     if (llm_arch_is_hybrid(model.arch)) {
         return new llama_memory_kvmem_hybrid(model, params, cparams);
@@ -1015,7 +1088,7 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         cudaStream_t st = cudaStreamPerThread;
         bool copy_ok = true;
         for (uint32_t il = 0; il < n_layer_ && copy_ok; ++il) {
-            if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+            if (!layer_managed(static_cast<int32_t>(il))) {
                 continue;
             }
             ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
@@ -1513,6 +1586,15 @@ void llama_memory_kvmem::note_ubatch_pos(const std::vector<llama_pos> & pos) {
 
 void llama_memory_kvmem::register_capture(ggml_tensor * t, int il, char which) {
     if (!t) {
+        return;
+    }
+    if (il < 0 || !model_.hparams.has_kv(static_cast<uint32_t>(il)) ||
+            model_.hparams.is_swa(static_cast<uint32_t>(il))) {
+        // One filter at the single registration entry covers every capture
+        // consumer (host harvest, GPU harvest fallback, decode-mean): SWA
+        // head geometry differs from the managed-layer scorer buffers and
+        // their far-token K is never staged back; KV-shared layers own no K
+        // snapshot for the scorer to match against.
         return;
     }
     pending_capture_.push_back({t, il, which});
@@ -2149,6 +2231,12 @@ void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * h
     if (!host || il < 0 || static_cast<uint32_t>(il) >= n_layer_ || cur_pos_.empty()) {
         return;
     }
+    if (model_.hparams.is_swa(static_cast<uint32_t>(il))) {
+        // SWA layers roll out of the window and are never staged back; their
+        // head geometry also differs from the managed layers the retrieval
+        // scorer assumes (single n_embd_head_ buffer), so never capture them.
+        return;
+    }
     const uint32_t n = static_cast<uint32_t>(cur_pos_.size());
     const uint32_t pos0 = static_cast<uint32_t>(cur_pos_[0]);
     if (which == 'k') {
@@ -2391,7 +2479,7 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
     uint32_t n_ok = 0;
     uint32_t n_skip = 0;
     for (uint32_t il = 0; il < n_layer_; ++il) {
-        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+        if (!layer_managed(static_cast<int32_t>(il))) {
             continue;
         }
         const uint32_t nget = (cell0 < kv_size_)
@@ -2441,7 +2529,7 @@ void llama_memory_kvmem::harvest_full_blocks_async() {
         }
         bool need = false;
         for (uint32_t il = 0; il < n_layer_; ++il) {
-            if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+            if (!layer_managed(static_cast<int32_t>(il))) {
                 continue;
             }
             if (!raw_->has_k_gpu(b.block_id, il, b.n_tokens) ||
@@ -2684,7 +2772,7 @@ void llama_memory_kvmem::decode_mean_flush() {
     uint32_t n_host = 0;
     float rms = 0.0f;
     for (uint32_t il = 0; il < n_layer_; ++il) {
-        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+        if (!layer_managed(static_cast<int32_t>(il))) {
             continue;
         }
         const uint8_t src = (il < decode_mean_src_.size()) ? decode_mean_src_[il] : 0;
@@ -2772,7 +2860,7 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
         }
     };
     for (uint32_t il = 0; il < n_layer_; ++il) {
-        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+        if (!layer_managed(static_cast<int32_t>(il))) {
             continue;
         }
         const int64_t t_copy = ggml_time_us();
@@ -2817,7 +2905,7 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
     const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
     const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
     for (uint32_t il = 0; il < n_layer_; ++il) {
-        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+        if (!layer_managed(static_cast<int32_t>(il))) {
             continue;
         }
         ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
@@ -2855,7 +2943,7 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
     const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
     const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
     for (uint32_t il = 0; il < n_layer_; ++il) {
-        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+        if (!layer_managed(static_cast<int32_t>(il))) {
             continue;
         }
         ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
@@ -3117,7 +3205,7 @@ bool llama_memory_kvmem::get_query(llama_kvmem_query_state & state) {
     bool any = false;
     uint32_t rows = 0;
     for (uint32_t il = 0; il < n_layer_; ++il) {
-        if (!kvmem_cache_has_layer(kv_, il)) continue;
+        if (!layer_managed(il)) continue;
         if (!q_count_[il] || (rows && rows != q_count_[il])) return false;
         rows = q_count_[il];
         any = true;
@@ -3135,7 +3223,7 @@ bool llama_memory_kvmem::set_query(const llama_kvmem_query_state & state) {
         const auto & v = state.sum[il];
         if (v.size() != n_head_ * n_embd_head_ ||
                 !std::all_of(v.begin(), v.end(), [](float x) { return std::isfinite(x); })) return false;
-        if (!kvmem_cache_has_layer(kv_, il)) continue;
+        if (!layer_managed(il)) continue;
         if (!state.count[il] || (rows && rows != state.count[il])) return false;
         rows = state.count[il];
     }
@@ -3334,7 +3422,7 @@ bool llama_memory_kvmem::read_gpu_block(uint32_t block_id, uint32_t il, bool is_
                                         std::vector<float> & out) const {
     const auto & store = runtime_->store();
     if (block_id >= store.block_count() || il >= n_layer_ ||
-        !kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+        !layer_managed(static_cast<int32_t>(il))) {
         return false;
     }
     const kvmem::KvMemBlock & blk = store.blocks()[block_id];
@@ -3432,7 +3520,7 @@ void llama_memory_kvmem::dump_kv_compare(int32_t block_id, bool writeback_test) 
     const uint32_t layers_show[] = {0, n_layer_ / 2, n_layer_ > 0 ? n_layer_ - 1 : 0};
     for (uint32_t li = 0; li < 3; ++li) {
         const uint32_t il = layers_show[li];
-        if (il >= n_layer_ || !kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+        if (il >= n_layer_ || !layer_managed(static_cast<int32_t>(il))) {
             continue;
         }
         if (!read_gpu_block(bid, il, true, gpu_k)) {
@@ -3476,7 +3564,7 @@ void llama_memory_kvmem::dump_kv_compare(int32_t block_id, bool writeback_test) 
 
     uint32_t il_wb = 0;
     while (il_wb < n_layer_ &&
-           (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il_wb)) ||
+           (!layer_managed(static_cast<int32_t>(il_wb)) ||
             !raw_->has_k_gpu(bid, il_wb))) {
         il_wb++;
     }
@@ -3791,4 +3879,141 @@ void llama_kvmem_get_tail_mean(uint32_t row, std::vector<float> & state) {
 
 void llama_kvmem_set_tail_mean(uint32_t row, const std::vector<float> & state) {
     if (auto * mem = kvmem_capture_active()) mem->raw().restore_mean_checkpoint(row, state);
+}
+
+// ---------------------------------------------------------------------------
+// llama_memory_kvmem_swa - gemma-style interleaved SWA support.
+//
+// Stock iswa memory holds two uniform-geometry kv caches: kv_base (dense/
+// global layers) and kv_swa (rolling window layers). This variant borrows
+// kv_base into a KVMem slot-pool (bounded cells, block eviction, retrieval,
+// host/NVMe tiers) while kv_swa keeps the native rolling window. Mirrors
+// llama_memory_kvmem_hybrid, which does the same for the attention half of
+// recurrent hybrids.
+// ---------------------------------------------------------------------------
+
+static uint32_t kvmem_swa_base_cells(const llama_model & model,
+                                     const llama_memory_params & params,
+                                     const llama_cparams & cparams) {
+    // iswa sizes the SWA cache as min(base_cells, n_swa*n_seq + n_ubatch):
+    // a KVMem budget smaller than the rolling window would truncate the SWA
+    // cache and fail every prepare(). Floor the base at the window need; the
+    // slot-pool re-derives its slot count from the borrowed cache size.
+    const uint32_t pool = llama_kvmem_pool_cells(model, params, cparams);
+    const uint32_t swa_min = model.hparams.n_swa * std::max(1u, cparams.n_seq_max)
+                           + cparams.n_ubatch;
+    return std::max(pool, swa_min);
+}
+
+// gemma3n/gemma4 KV-sharing (E2B/E4B-style): layers at or past
+// n_layer_kv_from_start reuse the last dense / last SWA layer's KV instead of
+// owning their own cache. Replicated exactly from llama-model.cpp's stock
+// reuse callback; for models without KV sharing (n_layer_kv_from_start ==
+// n_layer) every lookup returns -1 (no-op), same as stock. Shared across
+// both iswa sub-caches because the remap uses absolute layer ids into
+// map_layer_ids, which each cache populates for exactly its own (filter-ed)
+// layers - and both shared-layer classes always land in the same half.
+static llama_memory_i::layer_reuse_cb kvmem_swa_reuse_cb(const llama_model & model) {
+    if (model.arch != LLM_ARCH_GEMMA3N && model.arch != LLM_ARCH_GEMMA4) {
+        return nullptr;
+    }
+    const llama_hparams * hp = &model.hparams;
+    return [hp](uint32_t il) {
+        GGML_ASSERT(hp->n_layer_kv_from_start >= 2);
+
+        if (il >= (uint32_t) hp->n_layer_kv_from_start) {
+            return hp->n_layer_kv_from_start - (hp->is_swa(il) ? 2 : 1);
+        }
+
+        return -1;
+    };
+}
+
+llama_memory_kvmem_swa::llama_memory_kvmem_swa(
+        const llama_model & model,
+        const llama_memory_params & params,
+        const llama_cparams & cparams) :
+    llama_kv_cache_iswa(
+            model,
+            params.type_k,
+            params.type_v,
+            !cparams.flash_attn,
+            cparams.offload_kqv,
+            params.swa_full,
+            /* unified */ true,
+            kvmem_swa_base_cells(model, params, cparams),
+            std::max((uint32_t) 1, cparams.n_seq_max),
+            cparams.n_ubatch,
+            /* n_pad */ 1,
+            /* mem_other */ nullptr,
+            /* filter */ nullptr,
+            kvmem_swa_reuse_cb(model),
+            /* share */ nullptr) {
+    attn_kvmem_ = std::make_unique<llama_memory_kvmem>(
+            model, params, cparams, get_base());
+    LLAMA_LOG_INFO("%s: KVMem SWA (base=slot-pool swa=stock-window) n_dense_layers=%u\n",
+            __func__, kvmem_n_attn_layers(model));
+}
+
+llama_memory_context_ptr llama_memory_kvmem_swa::init_batch(
+        llama_batch_allocr & balloc,
+        uint32_t n_ubatch,
+        bool embd_all) {
+    GGML_UNUSED(embd_all);
+
+    do {
+        balloc.split_reset();
+
+        std::vector<llama_ubatch> ubatches;
+        while (true) {
+            auto ubatch = balloc.split_simple(n_ubatch);
+            if (ubatch.n_tokens == 0) {
+                break;
+            }
+            ubatches.push_back(std::move(ubatch));
+        }
+
+        if (balloc.get_n_used() < balloc.get_n_tokens()) {
+            break;
+        }
+
+        // KVMem owns the base cache: retrieval/staging runs inside
+        // prepare_ubatches, which also yields the base slot infos.
+        llama_kv_cache::slot_info_vec_t sinfos_base;
+        if (!attn_kvmem_->prepare_ubatches(ubatches, balloc.get_n_tokens(), sinfos_base)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare KVMem base ubatches\n", __func__);
+            break;
+        }
+        if (sinfos_base.empty()) {
+            break;
+        }
+
+        auto sinfos_swa = get_swa()->prepare(ubatches);
+        if (sinfos_swa.empty()) {
+            break;
+        }
+
+        GGML_ASSERT(sinfos_base.size() == sinfos_swa.size());
+
+        return std::make_unique<llama_kv_cache_iswa_context>(
+                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+    } while (false);
+
+    return std::make_unique<llama_kv_cache_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+}
+
+void llama_memory_kvmem_swa::clear(bool data) {
+    llama_kv_cache_iswa::clear(data);
+    if (attn_kvmem_) {
+        attn_kvmem_->reset_policy();
+    }
+}
+
+bool llama_memory_kvmem_swa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // Base cells AND KVMem block metadata go through the slot-pool; the SWA
+    // cache keeps its native rolling semantics. Evaluate both sides even if
+    // one fails (matches stock iswa's non-short-circuit & semantics).
+    const bool base_ok = !attn_kvmem_ || attn_kvmem_->seq_rm(seq_id, p0, p1);
+    const bool swa_ok = get_swa()->seq_rm(seq_id, p0, p1);
+    return base_ok && swa_ok;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory.h"
 #include "llama-kvmem-hooks.h"
 
@@ -197,6 +198,12 @@ private:
     };
 
     uint32_t resident_tokens() const;
+    // Slot-pool-owned KV layer: an attention layer that is neither recurrent
+    // (hybrid models) nor sliding-window (gemma-style SWA models). SWA layers
+    // roll natively inside the shared kv-cache cells; every layout, copy,
+    // harvest and restore loop must skip them so compressed layer ordinals
+    // stay aligned with block_bytes.
+    bool layer_managed(int32_t il) const;
     bool prepare_working_set(uint32_t n_new_tokens);
     void apply_plan_to_kv(const kvmem::KvMemPlan & plan);
     // Place GPU-resident blocks into slots 0..N-1 in orig_pos order.
@@ -431,3 +438,32 @@ uint32_t llama_kvmem_pool_cells(
         const llama_model & model,
         const llama_memory_params & params,
         const llama_cparams & cparams);
+
+// llama_kv_cache_iswa whose base (dense/global-layer) half is a KVMem
+// slot-pool and whose SWA half remains the stock rolling window. Mirrors
+// llama_memory_kvmem_hybrid (attn=slot-pool recr=stock) for gemma-style
+// interleaved-SWA models. The graph still static_cast's the context to
+// llama_kv_cache_iswa_context, so no submodule changes are needed.
+class llama_memory_kvmem_swa : public llama_kv_cache_iswa {
+public:
+    llama_memory_kvmem_swa(
+            const llama_model & model,
+            const llama_memory_params & params,
+            const llama_cparams & cparams);
+
+    llama_memory_context_ptr init_batch(
+            llama_batch_allocr & balloc,
+            uint32_t n_ubatch,
+            bool embd_all) override;
+
+    bool get_can_shift() const override { return false; }
+
+    void clear(bool data) override;
+
+    bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+
+    llama_memory_kvmem * attn_kvmem() { return attn_kvmem_.get(); }
+
+private:
+    std::unique_ptr<llama_memory_kvmem> attn_kvmem_;
+};

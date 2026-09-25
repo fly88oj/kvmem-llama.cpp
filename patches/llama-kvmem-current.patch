@@ -585,52 +585,6 @@ index ef7a012..7e88f9e 100644
      } llama_batch;
  
      enum llama_model_kv_override_type {
-diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 8922dc1..41f3330 100644
---- a/src/CMakeLists.txt
-+++ b/src/CMakeLists.txt
-@@ -63,6 +63,41 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
- 
- target_link_libraries(llama PUBLIC ggml)
- 
-+if (LLAMA_KVMEM)
-+    if (LLAMA_KVMEM_ROOT STREQUAL "")
-+        message(FATAL_ERROR "LLAMA_KVMEM=ON requires LLAMA_KVMEM_ROOT")
-+    endif()
-+    target_sources(llama PRIVATE
-+        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem.cpp
-+        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem-hybrid.cpp
-+        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem-mtp.cpp
-+        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-batch.cpp
-+        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-capture.cpp
-+    )
-+    if (GGML_CUDA)
-+        enable_language(CUDA)
-+        target_sources(llama PRIVATE
-+            ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-stagein.cu)
-+        if (DEFINED CMAKE_CUDA_ARCHITECTURES)
-+            set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
-+        endif()
-+    endif()
-+    target_include_directories(llama PRIVATE
-+        ${LLAMA_KVMEM_ROOT}/kvmem/include
-+        ${LLAMA_KVMEM_ROOT}/src/adapter
-+        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src
-+    )
-+    target_compile_definitions(llama PRIVATE LLAMA_KVMEM=1)
-+    if (NOT TARGET kvmem)
-+        add_subdirectory(${LLAMA_KVMEM_ROOT}/kvmem ${CMAKE_BINARY_DIR}/kvmem-from-llama)
-+    endif()
-+    target_link_libraries(llama PRIVATE kvmem)
-+    find_package(CUDAToolkit QUIET)
-+    if (CUDAToolkit_FOUND)
-+        target_link_libraries(llama PRIVATE CUDA::cudart)
-+    endif()
-+endif()
-+
- if (BUILD_SHARED_LIBS)
-     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
-     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
 diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
 index 2b98a55..106ce11 100644
 --- a/src/llama-batch.cpp
@@ -1124,28 +1078,6 @@ index 5d567a6..566b46b 100644
      // note: call only if the cell is not empty
      llama_pos pos_get(uint32_t i) const {
          assert(i < pos.size());
-diff --git a/src/llama-kvmem-factory.h b/src/llama-kvmem-factory.h
-new file mode 100644
-index 0000000..8493b3e
---- /dev/null
-+++ b/src/llama-kvmem-factory.h
-@@ -0,0 +1,16 @@
-+#pragma once
-+
-+// Thin hook used by llama_model::create_memory when LLAMA_KVMEM is enabled.
-+// Implementation lives out-of-tree in src/adapter/.
-+
-+struct llama_memory_i;
-+struct llama_model;
-+struct llama_memory_params;
-+struct llama_cparams;
-+
-+#if defined(LLAMA_KVMEM)
-+llama_memory_i * llama_memory_kvmem_maybe_create(
-+        const llama_model & model,
-+        const llama_memory_params & params,
-+        const llama_cparams & cparams);
-+#endif
 diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
 index 42c7381..35aab9e 100644
 --- a/src/llama-memory-hybrid.cpp
@@ -1523,6 +1455,30 @@ index ad66126..831d0a2 100644
      const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
  
      // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
+diff --git a/src/models/gemma4.cpp b/src/models/gemma4.cpp
+index aa518c6..3c492d2 100644
+--- a/src/models/gemma4.cpp
++++ b/src/models/gemma4.cpp
+@@ -207,6 +207,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
+             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+             cb(Qcur, "Qcur_normed", il);
+ 
++            kvmem_capture_q(Qcur, il);
++
+             Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+                                  ext_factor, attn_factor, beta_fast, beta_slow);
+             cb(Qcur, "Qcur_pos", il);
+@@ -231,6 +233,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
+             cb(Kcur, "Kcur_normed", il);
+             cb(Vcur, "Vcur_normed", il);
+ 
++            // pre-rope K for KVMem retrieval scoring (SWA layers are filtered
++            // inside register_capture; they roll out of the window anyway)
++            kvmem_capture_k(Kcur, il);
++
+             Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+                                  ext_factor, attn_factor, beta_fast, beta_slow);
+ 
 diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
 index f4b2a2a..d75c2db 100644
 --- a/src/models/qwen3.cpp
