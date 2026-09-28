@@ -1872,8 +1872,11 @@ int main(int argc, char ** argv) {
         if (!nvme_dir.empty()) {
             st.kparams.nvme_dir = nvme_dir.c_str();
         }
-        llama_kvmem_set_params(&st.kparams);
     }
+    // Report unconditionally: latches the adapter's "CLI host" flag so ambient
+    // KVMEM_* env vars can never alter this process' explicit configuration,
+    // including the disabled (--no-kvmem) case.
+    llama_kvmem_set_params(&st.kparams);
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = ngl;

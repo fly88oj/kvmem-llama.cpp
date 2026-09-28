@@ -11,7 +11,16 @@ if (KVMEM_ENABLE_NVME)
     # is enabled (an all-guarded TU would trigger MSVC LNK4221).
     list(APPEND KVMEM_SOURCES src/host/nvme_platform.cpp)
 endif()
-add_library(kvmem ${KVMEM_SOURCES})
+# Windows builds are always static here (the root defaults BUILD_SHARED_LIBS
+# OFF; the LM Studio shared tree needs kvmem absorbed into llama.dll and an
+# unexported Windows SHARED lib would strand its symbols). Keep the
+# BUILD_SHARED_LIBS-driven type elsewhere so the Linux CUDA prebuilt packaging
+# keeps shipping libkvmem.so alongside libllama.so.
+if (WIN32)
+    add_library(kvmem STATIC ${KVMEM_SOURCES})
+else()
+    add_library(kvmem ${KVMEM_SOURCES})
+endif()
 set_target_properties(kvmem PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(kvmem PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(kvmem PUBLIC cxx_std_17)

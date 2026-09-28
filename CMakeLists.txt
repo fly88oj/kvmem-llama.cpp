@@ -35,8 +35,15 @@ if (KVMEM_BUILD_LLAMA)
     set(LLAMA_KVMEM_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH "" FORCE)
     set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
-    set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
+    # KVMem ships its own server/cli; the stock llama-server/app are off by default
+    # but stay opt-in for integrators that consume the standard binaries (the
+    # LM Studio runtime pack: scripts/windows/build-hip.ps1 -LmsShared).
+    if (NOT LLAMA_BUILD_SERVER)
+        set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    endif()
+    if (NOT LLAMA_BUILD_APP)
+        set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
+    endif()
     set(LLAMA_BUILD_TOOLS ON CACHE BOOL "")
     set(LLAMA_BUILD_COMMON ON CACHE BOOL "")
 

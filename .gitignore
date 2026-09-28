@@ -27,3 +27,6 @@ __pycache__/
 /tests-data/*
 !/tests-data/gen_bench.py
 !/tests-data/gen_needle.py
+
+# LM Studio extension pack build output (make-lms-extension.ps1)
+/dist-lms/

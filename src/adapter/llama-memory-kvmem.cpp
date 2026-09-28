@@ -240,15 +240,129 @@ static bool kvmem_env_perf() {
     return v == 1;
 }
 
+// Hosts that speak the --kvmem-* CLI (llama-kvmem-cli / llama-kvmem-server)
+// always call llama_kvmem_set_params() at startup - even without --kvmem -
+// which latches this flag so their explicit CLI defaults can never be
+// stomped by ambient KVMEM_* variables. Only hosts that never call
+// set_params (the stock llama-server inside an LM Studio runtime pack) fall
+// through to the env fallback, applied exactly once per process.
+static std::atomic<bool> g_kvmem_params_from_cli{false};
+
+static bool kvmem_env_u32(const char * name, uint32_t & out) {
+    const char * e = getenv(name);
+    if (!e || e[0] == '\0') {
+        return false;
+    }
+    char * end = nullptr;
+    const unsigned long v = strtoul(e, &end, 10);
+    if (!end || *end != '\0') {
+        LLAMA_LOG_WARN("%s: ignoring malformed %s='%s'\n", __func__, name, e);
+        return false;
+    }
+    out = (uint32_t) v;
+    return true;
+}
+
+static bool kvmem_env_f32(const char * name, float & out) {
+    const char * e = getenv(name);
+    if (!e || e[0] == '\0') {
+        return false;
+    }
+    char * end = nullptr;
+    const double v = strtod(e, &end);
+    if (!end || *end != '\0') {
+        LLAMA_LOG_WARN("%s: ignoring malformed %s='%s'\n", __func__, name, e);
+        return false;
+    }
+    out = (float) v;
+    return true;
+}
+
+// explicit off-whitelist: "0"/"off"/"false"/"no"/unset mean off; anything else on
+static bool kvmem_env_on(const char * name) {
+    const char * e = getenv(name);
+    if (!e || e[0] == '\0') {
+        return false;
+    }
+    return !(strcmp(e, "0") == 0 || strcmp(e, "off") == 0
+             || strcmp(e, "false") == 0 || strcmp(e, "no") == 0);
+}
+
+static void kvmem_apply_env(void) {
+    if (!kvmem_env_on("KVMEM_ENABLE")) {
+        return;
+    }
+    g_kvmem_params.enabled = true;
+    // Same non-sentinel defaults as the CLI hosts: query_begin >= 0 would
+    // make every block mandatory (bounded working set defeated), force_pos
+    // 0 is NOT "none" (-1 is).
+    g_kvmem_params.query_begin = -1;
+    g_kvmem_params.query_end   = -1;
+    g_kvmem_params.force_pos   = -1;
+
+    kvmem_env_u32("KVMEM_BLOCK_TOKENS", g_kvmem_params.block_tokens);
+    kvmem_env_u32("KVMEM_BUDGET", g_kvmem_params.budget);
+    kvmem_env_u32("KVMEM_GEN_RESERVE", g_kvmem_params.gen_reserve);
+    kvmem_env_u32("KVMEM_SINK_TOKENS", g_kvmem_params.sink_tokens);
+    kvmem_env_u32("KVMEM_RECENT_TOKENS", g_kvmem_params.recent_tokens);
+
+    const char * m = getenv("KVMEM_METHOD");
+    if (m && m[0]) {
+        if (strcmp(m, "recency") == 0) {
+            g_kvmem_params.method = 0;
+        } else if (strcmp(m, "retrieval") == 0) {
+            g_kvmem_params.method = 1;
+        } else {
+            LLAMA_LOG_WARN("%s: unknown KVMEM_METHOD='%s', using retrieval\n", __func__, m);
+            g_kvmem_params.method = 1;
+        }
+    } else {
+        g_kvmem_params.method = 1;  // match the CLI default
+    }
+
+    kvmem_env_f32("KVMEM_GPU_RATIO", g_kvmem_params.gpu_memory_ratio);
+    kvmem_env_f32("KVMEM_GPU_HIGH", g_kvmem_params.gpu_high_watermark);
+    kvmem_env_f32("KVMEM_GPU_LOW", g_kvmem_params.gpu_low_watermark);
+
+    float gb;
+    if (kvmem_env_f32("KVMEM_CPU_GB", gb) && gb > 0.0f) {
+        g_kvmem_params.cpu_bytes = (uint64_t) (gb * 1073741824.0f);
+    }
+    if (kvmem_env_f32("KVMEM_NVME_GB", gb) && gb > 0.0f) {
+        g_kvmem_params.nvme_bytes = (uint64_t) (gb * 1073741824.0f);
+    }
+    const char * nd = getenv("KVMEM_NVME_DIR");
+    if (nd && nd[0]) {
+        // own storage with process lifetime - must not alias environ, which a
+        // host may mutate (llama-kvmem-cli _putenv_s is such a pattern)
+        static std::string s_nvme_dir;
+        s_nvme_dir = nd;
+        g_kvmem_params.nvme_dir = s_nvme_dir.c_str();
+    }
+
+    g_kvmem_params.harvest_v   = kvmem_env_on("KVMEM_HARVEST_V");
+    g_kvmem_params.raw_k_nvme  = kvmem_env_on("KVMEM_RAW_K_NVME");
+    uint32_t mtp = 0;
+    if (kvmem_env_u32("KVMEM_MTP_STATE", mtp)) {
+        g_kvmem_params.mtp_state = (int32_t) mtp;  // 0 snapshots, 1 auto, 2 replay
+    }
+
+    LLAMA_LOG_INFO("%s: KVMem configured from KVMEM_* environment (host has no --kvmem CLI)\n", __func__);
+}
+
 void llama_kvmem_set_params(const struct llama_kvmem_params * params) {
     if (params) {
         g_kvmem_params = *params;
     } else {
         g_kvmem_params = {};
     }
+    g_kvmem_params_from_cli.store(true);
 }
 
 const struct llama_kvmem_params * llama_kvmem_get_params(void) {
+    if (!g_kvmem_params_from_cli.exchange(true)) {
+        kvmem_apply_env();
+    }
     return &g_kvmem_params;
 }
 
@@ -482,7 +596,10 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         const llama_model & model,
         const llama_memory_params & params,
         const llama_cparams & cparams) {
-    if (!g_kvmem_params.enabled) {
+    // Go through the accessor, not the raw global: this is the FIRST KVMem
+    // entry a host touches, so it triggers the one-time KVMEM_* env fallback
+    // for hosts without --kvmem CLI (stock llama-server / LM Studio pack).
+    if (!llama_kvmem_get_params()->enabled) {
         return nullptr;
     }
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {

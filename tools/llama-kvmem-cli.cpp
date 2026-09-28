@@ -338,8 +338,11 @@ int main(int argc, char ** argv) {
         } else {
             fprintf(stderr, "KVMEM_TRACE n_prompt=%d\n", n_prompt);
         }
-        llama_kvmem_set_params(&kparams);
     }
+    // Report unconditionally: calling set_params latches the "CLI host" flag
+    // in the adapter, making the process immune to ambient KVMEM_* env vars
+    // even when --kvmem is off (the KVMem-aware defaults live in kparams).
+    llama_kvmem_set_params(&kparams);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = static_cast<uint32_t>(n_ctx);
