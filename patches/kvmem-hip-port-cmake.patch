@@ -1,7 +1,7 @@
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -67,6 +67,9 @@
+@@ -74,6 +74,9 @@
      if (LLAMA_KVMEM_ROOT STREQUAL "")
          message(FATAL_ERROR "LLAMA_KVMEM=ON requires LLAMA_KVMEM_ROOT")
      endif()
@@ -11,7 +11,7 @@ diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
      target_sources(llama PRIVATE
          ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem.cpp
          ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem-hybrid.cpp
-@@ -82,6 +85,25 @@
+@@ -99,6 +102,25 @@
              set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
          endif()
      endif()
@@ -37,7 +37,7 @@ diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
      target_include_directories(llama PRIVATE
          ${LLAMA_KVMEM_ROOT}/kvmem/include
          ${LLAMA_KVMEM_ROOT}/src/adapter
-@@ -93,7 +115,7 @@
+@@ -110,7 +132,7 @@
      endif()
      target_link_libraries(llama PRIVATE kvmem)
      find_package(CUDAToolkit QUIET)

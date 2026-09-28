@@ -30,16 +30,20 @@ if (-not (Test-Path (Join-Path $bin 'llama-server.exe'))) {
 
 $backendsRoot = Join-Path $env:USERPROFILE '.lmstudio\extensions\backends'
 if (-not $TemplateBackend) {
-    # Version-aware pick. The pack is built against llama.cpp b81c99b which
-    # maps to the official 2.41.x engine layer; the kept official plugin DLLs
-    # (ggml-*.dll, ggml_llamacpp.dll) must come from that same family, so
-    # auto-select only the highest 2.41.x. Newer official packs need an
-    # explicit -TemplateBackend after re-validating the ABI pair by hand.
+    # Version-aware pick. The pack must be built against the llama.cpp release
+    # the chosen official engine layer ships with (currently b11189 ==
+    # official 2.46.x, per docs/lmstudio-runtime-packaging.md); the kept
+    # official plugin DLLs (ggml-*.dll, ggml_llamacpp.dll) must come from the
+    # same family as the pack base. Bump $templateFamily together with the
+    # submodule pin; other versions need an explicit -TemplateBackend after
+    # re-validating the ABI pair by hand.
+    $templateFamily = '2.46'
+    $excludeSelf = "*-$templateFamily.1"
     $cands = Get-ChildItem $backendsRoot -Directory -Filter 'llama.cpp-win-x86_64-amd-rocm-avx2-*' |
-        Where-Object { $_.Name -notlike '*-2.41.1' -and $_.Name -match '-(\d+\.\d+\.\d+)$' -and
-                       $Matches[1] -like '2.41.*' }
+        Where-Object { $_.Name -notlike $excludeSelf -and $_.Name -match '-(\d+\.\d+\.\d+)$' -and
+                       $Matches[1] -like "$templateFamily.*" }
     if (-not $cands) {
-        throw 'no official 2.41.x ROCm template backend found (install it in LM Studio or pass -TemplateBackend explicitly)'
+        throw "no official $templateFamily.x ROCm template backend found (install it in LM Studio or pass -TemplateBackend explicitly)"
     }
     $TemplateBackend = $cands | Sort-Object { [version]($_.Name -replace '.*-(\d+\.\d+\.\d+)$', '$1') } -Descending |
         Select-Object -First 1 -ExpandProperty FullName

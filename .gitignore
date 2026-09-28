@@ -30,3 +30,5 @@ __pycache__/
 
 # LM Studio extension pack build output (make-lms-extension.ps1)
 /dist-lms/
+
+/build-lms*/

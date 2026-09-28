@@ -29,11 +29,11 @@ stage 的同名 DLL 一并带上保证自包含。
 #    GGML_BACKEND_DL=OFF——adapter 直调 backend 入口无法跨插件 DLL 边界）
 powershell scripts/windows/build-hip.ps1 -LmsShared -BuildDir build-hip-lms
 
-# ② 打包并安装（克隆 2.41.0 → 覆盖 → manifest 版本自动 bump 到 2.41.1）
+# ② 打包并安装（克隆官方 2.46.0 → 覆盖 → manifest 版本自动 bump 到 2.46.1）
 powershell scripts/windows/make-lms-extension.ps1 -Install
 
 # ③ 选择引擎（或 LM Studio 里 Ctrl+Shift+R）
-lms runtime select "llama.cpp-win-x86_64-amd-rocm-avx2@2.41.1"
+lms runtime select "llama.cpp-win-x86_64-amd-rocm-avx2@2.46.1"
 ```
 
 配套的必要修改（都在仓库内）：
@@ -77,9 +77,18 @@ setx KVMEM_BLOCK_TOKENS 128;  setx KVMEM_CPU_GB 4;  setx KVMEM_NVME_GB 2
 
 ## 4. 前提与限制（实测确认）
 
-- **模型必须单并行**：KVMem 要求 `n_seq_max=1`；LM Studio 的 Parallel 保持 1
-  （GUI 加载设置 / `lms load --parallel 1`）。parallel>1 时日志出现
-  `KVMem requires n_seq_max=1` 后回退 stock KV（无害但不省内存）。
+- **模型必须单并行**：KVMem 要求 `n_seq_max=1`；LM Studio 的 Parallel 必须
+  手动设为 1（GUI 加载设置 / `lms load --parallel 1`）。**注意新版 runtime
+  （2.43+）默认 Parallel=4**——默认值下 KVMem 整个被旁路（日志
+  `KVMem requires n_seq_max=1` 后回退 stock），256K 上下文时 f16 KV ≈16.8GB
+  远超 VRAM，ggml host fallback 把 RAM 打满（27B IQ3_S + 24GB 空闲实测
+  `freeRAM=0.3GB`——这就是"选 KVMem runtime 仍占满内存"的真因组合：
+  Parallel=4 × f16 KV × MTP 默认 on）。
+- **带 nextn 头的模型（如 Qwen3.8-27B UD）必须在 LM Studio 关闭 MTP 草稿**：
+  app 默认加载 MTP draft context，其 KV 不受 KVMem 管理且与主 ctx 同 ctx 尺寸，
+  256K 下直接 `failed to create MTP context: failed to allocate compute pp
+  buffers` 加载失败（`lms load --no-speculative-draft-mtp` 或 GUI 关闭；
+  KVMem 的 MTP 走自有 `--spec-type draft-mtp`，不走该通道）。
 - **LM Studio 的 SWA 模型 VRAM 估算过保守**（把 gemma4 的 40 个滑窗层按全量
   KV 计入，131K 估 21GB；实际双缓存 ≈1.2GB），大 ctx 弹窗警告可忽略；
   KVMem 生效后实测 131072 ctx 仅 8.9GB VRAM。
@@ -90,7 +99,8 @@ setx KVMEM_BLOCK_TOKENS 128;  setx KVMEM_CPU_GB 4;  setx KVMEM_NVME_GB 2
   LM Studio 默认传 `--flash-attn off --cache-type-k/v f16`，该组合会触发
   rocBLAS 的 Tensile GEMM 路径，而 **gfx1201 缺预编译 Tensile 库**（上游已知
   gap；实测官方 ROCm 2.41.0 包在同样参数下同样 0xC0000409 启动即崩——非本
-  pack 问题）。FA on + q8_0 同时避开该路径并匹配 KVMem 最优实测配方
+  pack 问题；官方 2.46.0 亦未随包提供 gfx1201 Tensile 库，该要求保持不变）。
+  FA on + q8_0 同时避开该路径并匹配 KVMem 最优实测配方
   （pack 上验证：40K prompt 131K ctx 预填 2125 t/s、decode 55.6 t/s、完整
   needle 命中无崩溃）。
 - **已知 app 侧限制**：app 的 engine-protocol 转发对超长 prompt 的 `/v1/chat/completions`
@@ -102,12 +112,12 @@ setx KVMEM_BLOCK_TOKENS 128;  setx KVMEM_CPU_GB 4;  setx KVMEM_NVME_GB 2
 - MTP 加速不进 LM Studio 通道（app 有自己的 speculative 参数，仅当模型带
   nextn 且 app 支持时生效）。
 
-## 5. 验收记录（gemma-4-12B-it-QAT，LM Studio 0.4.25 + 2.41.1 pack）
+## 5. 验收记录（gemma-4-12B-it-QAT / Qwen3.8-27B-IQ3_S，LM Studio 0.4.25 + pack）
 
 | 检查 | 结果 |
 |---|---|
-| `lms runtime ls` 列出并可选 2.41.1 | ✓ |
-| app 日志 `LLM model loaded ... 2.41.1, contextLength 131072` | ✓ |
+| `lms runtime ls` 列出并可选 2.41.1（b81c99b 基线）/ 2.46.1（b11189 同步升级） | ✓ |
+| app 日志 `LLM model loaded ... 2.46.1` | ✓ 27B IQ3_S `-c 262144 --no-speculative-draft-mtp` 100% 加载，server 来自 2.46.1 pack 目录 |
 | server 进程 = pack 目录的 `llama-server.exe`（engine protocol 拉起） | ✓ |
 | `KVMEM_*` env 生效（修复后真实直证） | ✓ 手工同参全量：`KVMEM_TIERS cpu_slots=3855 nvme_slots=1927 slot_bytes=1114112`（managed 布局）+ `%TEMP%\kvmem_nvme` 创建 |
 | 40K prompt 端到端（llama-server 直连，FA on + q8_0） | ✓ prefill 2125 t/s、decode 55.6 t/s、正常释放无崩溃 |

@@ -244,14 +244,19 @@ static void check_batch_inputs(llama_model * model) {
             hidden[i*width+j] = -i*10-j-1;
         }
     }
-    llama_batch batch{};
-    batch.n_tokens = n;
-    batch.embd = input.data();
-    batch.embd_nextn = hidden.data();
-    batch.pos = pos.data();
-    batch.logical_pos = logical.data();
+    llama_batch_ext bext(n, width, width, 1, nullptr, 1, 4);
+    for (int i = 0; i < n; ++i) {
+        const int32_t idx = bext.add_token(0);
+        require(idx == i, "ext add_token failed");
+        const llama_pos p[4] = { 12, (llama_pos) (i/3), (llama_pos) (i%3), 12 };
+        require(bext.set_token_pos(idx, p), "ext set_token_pos failed");
+        const llama_embd e{ input.data() + (size_t) i*width, 1, (size_t) width };
+        require(bext.set_token_embd(idx, e), "ext set_token_embd failed");
+        require(bext.set_token_logical(idx, logical[i]), "ext set_token_logical failed");
+        require(bext.set_token_nextn(idx, hidden.data() + (size_t) i*width), "ext set_token_nextn failed");
+    }
     llama_batch_allocr allocator(4);
-    require(allocator.init(batch, *llama_model_get_vocab(model), nullptr, width, 1, true), "visual batch init failed");
+    require(allocator.init(bext, *llama_model_get_vocab(model), true), "visual batch init failed");
     allocator.split_reset();
     int seen = 0;
     while (seen < n) {
@@ -271,10 +276,18 @@ static void check_batch_inputs(llama_model * model) {
     std::vector<llama_seq_id> seq(n);
     std::vector<llama_seq_id *> ids(n);
     for (int i = 0; i < n; ++i) { seq[i] = i%2; ids[i] = &seq[i]; }
-    batch.n_seq_id = n_seq.data();
-    batch.seq_id = ids.data();
+    llama_batch_ext bext2(n, width, width, 2, nullptr, 1, 4);
+    for (int i = 0; i < n; ++i) {
+        const int32_t idx = bext2.add_token(seq[i]);
+        const llama_pos p[4] = { 12, (llama_pos) (i/3), (llama_pos) (i%3), 12 };
+        require(bext2.set_token_pos(idx, p), "reorder set_token_pos failed");
+        const llama_embd e{ input.data() + (size_t) i*width, 1, (size_t) width };
+        require(bext2.set_token_embd(idx, e), "reorder set_token_embd failed");
+        require(bext2.set_token_logical(idx, logical[i]), "reorder set_token_logical failed");
+        require(bext2.set_token_nextn(idx, hidden.data() + (size_t) i*width), "reorder set_token_nextn failed");
+    }
     llama_batch_allocr reordered(4);
-    require(reordered.init(batch, *llama_model_get_vocab(model), nullptr, width, 2, true), "reordered batch init failed");
+    require(reordered.init(bext2, *llama_model_get_vocab(model), true), "reordered batch init failed");
     reordered.split_reset();
     std::vector<bool> visited(n, false);
     for (int count = 0; count < n;) {
