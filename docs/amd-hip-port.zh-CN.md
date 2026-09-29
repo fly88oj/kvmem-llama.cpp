@@ -115,8 +115,36 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-serv
 | `-RocmRoot` | *（自动）* | 显式 ROCm 根；否则先从 `.venv-rocm` 解析，再看 `HIP_PATH`。 |
 | `-Jobs` | `min(16, 核数)` | 并行编译数（clang HIP 编译单元峰值约 2 GB/个）。 |
 | `-HostOnly` | *（关）* | 只构建 CPU 版 KVMem 主存库 + host 测试（无需 GPU 工具链）。 |
+| `-LmsShared` | *（关）* | LM Studio 轨道：共享库（`BUILD_SHARED_LIBS=ON`、`GGML_BACKEND_DL=OFF`）+ stock `llama-server`/`llama-app` target，白名单构建，跳过 ctest。产物仅供 `make-lms-extension.ps1` 打包——见打包文档。与 `-HostOnly` 互斥。 |
 
 产物：`build-hip\bin\Release\llama-kvmem-server.exe` 与 `llama-kvmem-cli.exe`。
+
+### 两条构建轨道（及其配置方式差异）
+
+| 轨道 | 命令 | 产物 | 用途 |
+|---|---|---|---|
+| **静态 KVMem 树**（默认） | `build-hip.ps1 [-BuildDir build-hip]` | `llama-kvmem-server.exe`、`llama-kvmem-cli.exe`、完整 ctest（13 项） | 独立 OpenAI 兼容服务器 / CLI：全部 `--kvmem-*` 参数、MTP（`--spec-type draft-mtp`）、NVMe 层、Web UI |
+| **LM Studio 共享树** | `build-hip.ps1 -LmsShared -BuildDir build-lms` | `llama.dll`、stock `llama-server.exe`、统一 `ggml*.dll` 组 | `make-lms-extension.ps1` 的输入 → `llama.cpp-win-x86_64-amd-rocm-avx2@2.46.1` 引擎包（[打包文档](lmstudio-runtime-packaging.md)） |
+
+分轨道运行注意事项：
+
+- **配置通道不同。**静态树的 `llama-kvmem-server` / `llama-kvmem-cli` 只认 CLI
+  参数：启动时无条件调 `llama_kvmem_set_params()`，因此 ambient `KVMEM_*`
+  环境变量**按设计被忽略**（为 LM Studio `setx` 过的机器，不带 `--kvmem`
+  跑基线仍是严格纯 stock）。LM Studio 树无参数透传——`KVMEM_*` env 是它
+  **唯一**的 KVMem 配置通道（打包文档 §3）。
+- **两条轨道不要共用同一个 `-BuildDir`。**CMake 缓存不同
+  （`BUILD_SHARED_LIBS`、`GGML_BACKEND_DL`、server/app target）；脚本会回写
+  开关自愈复用目录，但分开 `-BuildDir` 仍是可靠做法。
+- `-LmsShared` 跳过 ctest：KVMem 自带测试 exe 引用了共享 `llama.dll` 不导出的
+  llama 内部 C++ 类，故用 target 白名单构建。跑测试请用静态树。
+- `llama-kvmem-cli` 不接受 `-fa`/`--flash-attn`（FA 跟随后端默认）；
+  `llama-kvmem-server` 接受 `--flash-attn on|off|auto`。
+- LM Studio 轨道另需：已安装同版本族的官方 ROCm 模板包（当前 2.46.x，
+  `make-lms-extension.ps1` 会克隆它）、app 内 Parallel=1 / FA on / KV 8-bit /
+  关 app 级 MTP，并关闭扩展包自动更新（打包文档 §4）。
+- 子模块 pin 升级后，使用浏览器界面前需重建 Web UI
+  （`python scripts\build-webui.py`）。
 
 ### 用 27B 长上下文配方启动服务器
 

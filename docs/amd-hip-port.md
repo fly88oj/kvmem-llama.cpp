@@ -122,8 +122,41 @@ OpenAI-compatible client at `http://127.0.0.1:18200/v1`.
 | `-RocmRoot` | *(auto)* | Explicit ROCm root; otherwise resolved from `.venv-rocm` then `HIP_PATH`. |
 | `-Jobs` | `min(16, cores)` | Parallel compile jobs (clang HIP TUs peak ~2 GB each). |
 | `-HostOnly` | *(off)* | Build the CPU-only KVMem host library + host tests (no GPU toolchain needed). |
+| `-LmsShared` | *(off)* | LM Studio track: shared libraries (`BUILD_SHARED_LIBS=ON`, `GGML_BACKEND_DL=OFF`) + stock `llama-server`/`llama-app` targets, whitelisted target list, ctest skipped. Output feeds `make-lms-extension.ps1` only — see the packaging doc. Mutually exclusive with `-HostOnly`. |
 
 Products: `build-hip\bin\Release\llama-kvmem-server.exe` and `llama-kvmem-cli.exe`.
+
+### Two build tracks (and how their configuration differs)
+
+| Track | Command | Products | Use |
+|---|---|---|---|
+| **Static KVMem tree** (default) | `build-hip.ps1 [-BuildDir build-hip]` | `llama-kvmem-server.exe`, `llama-kvmem-cli.exe`, full ctest (13 tests) | Standalone OpenAI-compatible server / CLI: all `--kvmem-*` flags, MTP (`--spec-type draft-mtp`), NVMe tier, Web UI |
+| **LM Studio shared tree** | `build-hip.ps1 -LmsShared -BuildDir build-lms` | `llama.dll`, stock `llama-server.exe`, unified `ggml*.dll` set | Input for `make-lms-extension.ps1` → the `llama.cpp-win-x86_64-amd-rocm-avx2@2.46.1` engine pack ([packaging doc](lmstudio-runtime-packaging.md)) |
+
+Per-track runtime notes:
+
+- **Configuration channel differs.** The static tree's `llama-kvmem-server` /
+  `llama-kvmem-cli` take configuration from CLI flags only: they call
+  `llama_kvmem_set_params()` unconditionally at startup, so ambient `KVMEM_*`
+  environment variables are **ignored by design** (a machine that `setx`'d them
+  for LM Studio still gets a strictly stock baseline without `--kvmem`). The LM
+  Studio tree has no flag passthrough — `KVMEM_*` env is its **only** KVMem
+  configuration channel (packaging doc §3).
+- **Do not share one `-BuildDir` between tracks.** The CMake caches differ
+  (`BUILD_SHARED_LIBS`, `GGML_BACKEND_DL`, server/app targets); the script
+  rewrites the toggles to self-heal a reused directory, but separate
+  `-BuildDir`s remain the reliable path.
+- `-LmsShared` skips ctest: KVMem's own test executables reference llama-internal
+  C++ classes that a shared `llama.dll` does not export, so the build uses a
+  target whitelist. Run the static tree for tests.
+- `llama-kvmem-cli` does not accept `-fa`/`--flash-attn` (FA follows the backend
+  default); `llama-kvmem-server` does accept `--flash-attn on|off|auto`.
+- LM Studio track additionally requires: an installed official ROCm template
+  pack of the matching family (currently 2.46.x — `make-lms-extension.ps1`
+  clones it), Parallel=1 / FA on / KV 8-bit / app-MTP off in the app, and
+  disabled extension-pack auto-update (packaging doc §4).
+- After any submodule pin bump, rebuild the Web UI
+  (`python scripts\build-webui.py`) before using the browser interface.
 
 ### Run the server with the 27B long-context recipe
 

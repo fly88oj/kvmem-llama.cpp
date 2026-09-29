@@ -27,6 +27,7 @@ stage 的同名 DLL 一并带上保证自包含。
 ```powershell
 # ① 共享库 HIP 构建（产物与 artifacts 清单对齐；统一 ggml.dll，
 #    GGML_BACKEND_DL=OFF——adapter 直调 backend 入口无法跨插件 DLL 边界）
+#    双轨构建总览与逐轨注意事项见 docs/amd-hip-port.md §5“Two build tracks”
 powershell scripts/windows/build-hip.ps1 -LmsShared -BuildDir build-hip-lms
 
 # ② 打包并安装（克隆官方 2.46.0 → 覆盖 → manifest 版本自动 bump 到 2.46.1）
