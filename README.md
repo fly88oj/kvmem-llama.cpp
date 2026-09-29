@@ -112,7 +112,7 @@ scripts/apply-patches.sh
 scripts/build-cuda.sh
 ```
 
-The submodule is ggml-org/llama.cpp at pin `a25c986` (tag `b11189`, the release LM Studio's official ROCm runtime 2.46.0 ships). `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` (or `multimodal-upgrade.patch` on an older KVMem tree). Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. See [patches/README.md](patches/README.md).
+The submodule is ggml-org/llama.cpp at pin `6c7a87f` (tag `b11235`, the release LM Studio's official ROCm runtime 2.47.0 ships). `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` (or `multimodal-upgrade.patch` on an older KVMem tree). Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. See [patches/README.md](patches/README.md).
 
 `scripts/build-cuda.sh` sets `GGML_CUDA_FA_ALL_QUANTS=ON` (needed for `--kv-dtype q5_0` on hybrid models). Binaries: `build/bin/llama-kvmem-server`.
 

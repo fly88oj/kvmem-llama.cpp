@@ -32,7 +32,7 @@
 ## 2. 移植改动清单
 
 所有改动都在**本仓库内**（未改动 `kvmem/` 策略库）。`llama.cpp` 子模块保持在 pin
-`a25c986`（tag `b11189`，与 LM Studio 官方 ROCm runtime 2.46.0 同源）；移植以“补丁 + 树外文件”交付，因此未打补丁的纯净子模块构建与上游逐位一致。
+`6c7a87f`（tag `b11235`，与 LM Studio 官方 ROCm runtime 2.47.0 同源）；移植以“补丁 + 树外文件”交付，因此未打补丁的纯净子模块构建与上游逐位一致。
 
 | 文件 | 作用 |
 |---|---|
@@ -124,7 +124,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-serv
 | 轨道 | 命令 | 产物 | 用途 |
 |---|---|---|---|
 | **静态 KVMem 树**（默认） | `build-hip.ps1 [-BuildDir build-hip]` | `llama-kvmem-server.exe`、`llama-kvmem-cli.exe`、完整 ctest（13 项） | 独立 OpenAI 兼容服务器 / CLI：全部 `--kvmem-*` 参数、MTP（`--spec-type draft-mtp`）、NVMe 层、Web UI |
-| **LM Studio 共享树** | `build-hip.ps1 -LmsShared -BuildDir build-lms` | `llama.dll`、stock `llama-server.exe`、统一 `ggml*.dll` 组 | `make-lms-extension.ps1` 的输入 → `llama.cpp-win-x86_64-amd-rocm-avx2@2.46.1` 引擎包（[打包文档](lmstudio-runtime-packaging.md)） |
+| **LM Studio 共享树** | `build-hip.ps1 -LmsShared -BuildDir build-lms` | `llama.dll`、stock `llama-server.exe`、统一 `ggml*.dll` 组 | `make-lms-extension.ps1` 的输入 → `llama.cpp-win-x86_64-amd-rocm-avx2@2.47.1` 引擎包（[打包文档](lmstudio-runtime-packaging.md)） |
 
 分轨道运行注意事项：
 
@@ -140,7 +140,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-serv
   llama 内部 C++ 类，故用 target 白名单构建。跑测试请用静态树。
 - `llama-kvmem-cli` 不接受 `-fa`/`--flash-attn`（FA 跟随后端默认）；
   `llama-kvmem-server` 接受 `--flash-attn on|off|auto`。
-- LM Studio 轨道另需：已安装同版本族的官方 ROCm 模板包（当前 2.46.x，
+- LM Studio 轨道另需：已安装同版本族的官方 ROCm 模板包（当前 2.47.x，
   `make-lms-extension.ps1` 会克隆它）、app 内 Parallel=1 / FA on / KV 8-bit /
   关 app 级 MTP，并关闭扩展包自动更新（打包文档 §4）。
 - 子模块 pin 升级后，使用浏览器界面前需重建 Web UI
@@ -212,14 +212,14 @@ runtime 测试输出结构化诊断，如
 
 ```bash
 tmp=$(mktemp -d)
-git -C llama.cpp archive a25c986 | tar -x -C "$tmp"
+git -C llama.cpp archive 6c7a87f | tar -x -C "$tmp"
 git -C "$tmp" init -q
 git -C "$tmp" apply patches/llama-kvmem-current.patch     # KVMem 累积基线
 git -C "$tmp" apply patches/kvmem-hip-port-cmake.patch    # HIP cmake delta
 git diff --no-index llama.cpp/src "$tmp/src"              # 期望：无输出
 ```
 
-**结果：** 累积补丁可干净地应用到纯净 pin `a25c986`，HIP delta 叠加其上，重放出的树与
+**结果：** 累积补丁可干净地应用到纯净 pin `6c7a87f`，HIP delta 叠加其上，重放出的树与
 工作树**逐字节一致**（已核对 `llama-kv-cache.cpp`、`llama-kv-cells.h`、
 `llama-graph.cpp`、`speculative.cpp`、`llama-model.cpp`、`src/CMakeLists.txt`）。基线补丁
 不含 HIP，HIP 接线隔离在 delta 补丁中。
@@ -307,7 +307,7 @@ gen_reserve=1024、block=128、CPU arena 12 GiB。档位名是 `-c` 配置，真
 | A7/B | q8_0 K + q4_0 V | 参数 | 3213 | 86.2 | 5720 | YES | ➖ 备选（显存敏感时；质量样本单一） |
 | B | `GGML_HIP_NO_VMM=OFF` + `NATIVE=ON` | 重编译 | 1537 | 72.1 | 5819 | YES | ❌ **VMM 有害：f16 prefill −52%** |
 | C | `GGML_CUDA_FORCE_CUBLAS=ON` | 重编译 | 658 | 72.6 | 6200 | YES* | ❌ **−80% prefill + rocBLAS 错误** |
-| — | hipBLASLt（`GGML_HIPBLAS`） | 重编译 | — | — | — | — | 🚫 排除：决策时 pin `b81c99b` 无集成（现已升 `a25c986`，未重测） |
+| — | hipBLASLt（`GGML_HIPBLAS`） | 重编译 | — | — | — | — | 🚫 排除：决策时 pin `b81c99b` 无集成（现已升 `b11235`，未重测） |
 | — | FA on/off | 参数 | — | — | — | — | 🚫 排除：代码证据——q8_0 V 强制要求 FA enabled（`llama-context.cpp`），`auto` 已生效 |
 | — | 线程 `-t` 调优 | 参数 | — | — | — | — | 🚫 排除：`-ngl 99` 全卸载下 CPU 仅采样；B2 vs A2 差异 <2%（噪声） |
 
@@ -386,7 +386,7 @@ prefill 更快——KVMem 用于 >=30K。检索重排（`layout_d2h` + `layout_h
   **decode**（`Q->ne[1]=1`、`gqa_ratio_eff=8`、乘积 8，不 >8）则正确地用 tile/vec 内核：
   WMMA 在有效 batch 8 时填不满 16 宽 tile，且 decode 本就受显存带宽限制。新版
   llama.cpp 的 `GGML_HIP_ROCWMMA_FATTN` 开关在此多余——该路径按 arch
-  门控、RDNA4 已自动启用（`b81c99b` 与 `a25c986` 均如此）。所以最大的疑似杆杆已被利用，无额外空间。
+  门控、RDNA4 已自动启用（`b81c99b` 与 `b11235` 均如此）。所以最大的疑似杆杆已被利用，无额外空间。
 - **rocBLAS/Tensile gfx1201 内核**：wheel 的 rocBLAS 缺 gfx1201 的 Tensile 分发（所以
   `FORCE_CUBLAS` 实测 -80% prefill）；目前无社区预编译 logic 包覆盖 gfx1201（仅 <=gfx1150），
   故 mmq 是当前矩阵乘路径。自行为 gfx1201 调优 Tensile 是剩下唯一的大 prefill 杆杆，
@@ -556,3 +556,29 @@ Qwen3.8-27B IQ3_S 40K@256K 无崩；2.46.1 pack 经 LM Studio 加载 27B `-c 262
 **LM Studio 使用提醒**（详见打包文档）：Parallel=1、Flash Attention on、KV
 8-bit、关闭 app 级 MTP——2.43+ 的 runtime 默认 Parallel=4，会整体旁路 KVMem，
 256K 下直接把主机内存打满。
+
+---
+
+## 14. 上游同步到 b11235 / LM Studio runtime 2.47.1（2026-09-30）
+
+pin 从 `a25c986`（b11189）升到 `6c7a87f`（tag `b11235`），与 LM Studio 官方
+ROCm runtime 2.47.0 同源；KVMem 扩展包发布为 **2.47.1**。
+
+- 累积补丁在 b11235 上**零冲突**重放；仅 HIP cmake delta 因行号漂移需重生成
+  （emit-hip-patch.py 处理）。
+- **修复 b11189 同步时发布的不完整补丁**：batch-ext 端口
+  （`logical_pos`/`embd_nextn` 经 `llama_batch_ext`）与新文件
+  `src/llama-kvmem-factory.h` 当时未进入已提交的累积补丁（只在脏工作树上
+  验证过）。两者现已入补丁，且 **clean-tree 重放验证**（纯净 `git archive`
+  + 累积补丁 + delta → 与工作树逐字节一致）成为每次 pin 升级的必做项——
+  未跟踪新文件需先 `git add -N` 再生成 diff。
+- 新 base 行为变化：stock `llama-cli` 不再向重定向 stdout 打印生成文本；
+  server 移除了旧 `/completion` 端点（用 `/v1/chat/completions`）；KVMem
+  一致性对照改经 server API 进行。
+
+验证（b11235）：静态树 98/98 + ctest 13/13；clean-tree 重放逐字节一致；
+LmsShared 树一次链接通过；真机回归——Qwopus-9B MTP 128K needle HIT、gemma4
+stock/KVMem server 输出一致、Qwen3.8-27B IQ3_S 40K@256K 无崩；2.47.1 pack
+加载 27B `-c 262144 --parallel 1 --no-speculative-draft-mtp` 并正确应答
+（`fa=on`、`kkv=q8_0`，空闲内存健康）。Web UI 在新基线重建
+（`build-webui.py`）并经静态 server HTTP 200 验证。

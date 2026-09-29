@@ -55,7 +55,7 @@ index 1b89a04..87584c8 100644
  // was recorded. Cleared when a new start sequence re-arms the sampler.
  const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl);
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 06dea1e..bc33776 100644
+index 27a752c..c75a1c6 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -317,7 +317,7 @@ struct common_sampler * common_sampler_init(
@@ -294,10 +294,10 @@ index 224bdef..0021a48 100644
              struct ggml_context * ctx,
              struct ggml_tensor  * q,
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 8bb0ff7..ca9ea1b 100644
+index 24c4756..60a205c 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2090,6 +2090,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2080,6 +2080,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                  ggml_compute_forward_solve_tri(params, tensor);
              } break;
          case GGML_OP_GATED_DELTA_NET:
@@ -305,7 +305,7 @@ index 8bb0ff7..ca9ea1b 100644
              {
                  ggml_compute_forward_gated_delta_net(params, tensor);
              } break;
-@@ -2289,6 +2290,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2279,6 +2280,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_COUNT_EQUAL:
          case GGML_OP_SOLVE_TRI:
          case GGML_OP_GATED_DELTA_NET:
@@ -313,7 +313,7 @@ index 8bb0ff7..ca9ea1b 100644
          case GGML_OP_DSV4_HC_COMB:
          case GGML_OP_DSV4_HC_PRE:
          case GGML_OP_DSV4_HC_POST:
-@@ -3031,10 +3033,11 @@ struct ggml_cplan ggml_graph_plan(
+@@ -3017,10 +3019,11 @@ struct ggml_cplan ggml_graph_plan(
                          cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
                      } break;
                  case GGML_OP_GATED_DELTA_NET:
@@ -327,7 +327,7 @@ index 8bb0ff7..ca9ea1b 100644
                      } break;
                  case GGML_OP_COUNT:
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index ba00a0a..0bbdd0a 100644
+index a07e1f9..e866fd4 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -10934,15 +10934,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
@@ -506,10 +506,10 @@ index f9bf437..05adbb4 100644
  struct ggml_cuda_gated_delta_net_fused_cache {
      float * data;        // rollback slot 0
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e76ff31..bc9f916 100644
+index b50d05d..ee7d6c2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2378,6 +2378,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2377,6 +2377,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
              ggml_cuda_op_gated_linear_attn(ctx, dst);
              break;
          case GGML_OP_GATED_DELTA_NET:
@@ -571,7 +571,7 @@ index cdc10a7..9b59565 100644
      result->src[1] = k;
      result->src[2] = v;
 diff --git a/include/llama.h b/include/llama.h
-index 1805ed0..ef8fa96 100644
+index e808fa9..e5b54ad 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -269,6 +269,10 @@ extern "C" {
@@ -642,10 +642,56 @@ index afdaddc..aae81a7 100644
      set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
      target_compile_definitions(llama PRIVATE LLAMA_BUILD)
 diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
-index 89a1f3f..cbf474a 100644
+index 89a1f3f..99f1793 100644
 --- a/src/llama-batch.cpp
 +++ b/src/llama-batch.cpp
-@@ -793,6 +793,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+@@ -180,6 +180,36 @@ bool llama_batch_allocr::init(
+     batch.seq_id   = seq_id.data();
+     batch.logits   = output.data();
+ 
++    //
++    // KVMem: carry logical cache-row IDs and MTP hidden rows through the ext->batch conversion
++    //
++
++    {
++        bool has_logical = false;
++        bool has_nextn   = false;
++        for (int32_t i = 0; i < n_tok; ++i) {
++            has_logical |= batch_inp.tokens[i].logical_pos >= 0;
++            has_nextn   |= batch_inp.tokens[i].nextn != nullptr;
++        }
++        if (has_logical) {
++            logical_vec.resize(n_tok);
++            for (int32_t i = 0; i < n_tok; ++i) {
++                logical_vec[i] = batch_inp.tokens[i].logical_pos >= 0
++                    ? batch_inp.tokens[i].logical_pos : batch_inp.tokens[i].pos[0];
++            }
++            batch.logical_pos = logical_vec.data();
++        }
++        if (has_nextn) {
++            nextn_vec.resize((size_t) n_tok * n_embd);
++            for (int32_t i = 0; i < n_tok; ++i) {
++                if (batch_inp.tokens[i].nextn) {
++                    memcpy(nextn_vec.data() + (size_t) i * n_embd, batch_inp.tokens[i].nextn, (size_t) n_embd * sizeof(float));
++                }
++            }
++            batch.embd_nextn = nextn_vec.data();
++        }
++    }
++
+     //
+     // compute stats
+     //
+@@ -759,6 +789,8 @@ void llama_batch_allocr::clear() {
+ 
+     token_vec   .clear();
+     embd_vec    .clear();
++    logical_vec .clear();
++    nextn_vec   .clear();
+     seq_id_data .clear();
+     pos         .clear();
+     n_seq_id    .clear();
+@@ -793,6 +825,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
  
      udata->token     .resize(n_tokens);
      udata->embd      .resize(n_embd_all);
@@ -654,7 +700,7 @@ index 89a1f3f..cbf474a 100644
      udata->pos       .resize(n_pos_all);
      udata->n_seq_id  .resize(n_tokens);
      udata->seq_id    .resize(n_tokens);
-@@ -812,6 +814,12 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+@@ -812,6 +846,12 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
          if (batch.embd) {
              memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
          }
@@ -667,7 +713,7 @@ index 89a1f3f..cbf474a 100644
  
          for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
              // if we are using M-RoPE
-@@ -869,6 +877,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+@@ -869,6 +909,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
          /*.data         =*/ std::move(udata),
      };
  
@@ -677,8 +723,46 @@ index 89a1f3f..cbf474a 100644
      if (debug > 0) {
          LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);
  
+@@ -1112,6 +1155,22 @@ bool llama_batch_ext::set_token_id(int32_t idx, llama_token id) {
+     return true;
+ }
+ 
++bool llama_batch_ext::set_token_logical(int32_t idx, llama_pos logical) {
++    if (idx < 0 || idx >= (int32_t) tokens.size()) {
++        return false;
++    }
++    tokens[idx].logical_pos = logical;
++    return true;
++}
++
++bool llama_batch_ext::set_token_nextn(int32_t idx, const float * row) {
++    if (idx < 0 || idx >= (int32_t) tokens.size()) {
++        return false;
++    }
++    tokens[idx].nextn = row;
++    return true;
++}
++
+ bool llama_batch_ext::set_token_embd(int32_t idx, llama_embd embd_in) {
+     if (idx < 0 || idx >= (int32_t) tokens.size()) {
+         return false;
+@@ -1296,6 +1355,14 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
+             t.id = batch_inp.token[i];
+         }
+ 
++        // KVMem: carry logical cache-row ID and MTP hidden row through the public->ext conversion
++        if (batch_inp.logical_pos) {
++            t.logical_pos = batch_inp.logical_pos[i];
++        }
++        if (has_embd && batch_inp.embd_nextn) {
++            t.nextn = batch_inp.embd_nextn + (int64_t) i * n_embd_row;
++        }
++
+         if (has_embd) {
+             t.has_embd = true;
+             t.embd_off = batch_ext->embd.size();
 diff --git a/src/llama-batch.h b/src/llama-batch.h
-index 201d48c..0c2ec14 100644
+index 201d48c..9a85ec8 100644
 --- a/src/llama-batch.h
 +++ b/src/llama-batch.h
 @@ -56,6 +56,8 @@ struct llama_ubatch {
@@ -699,8 +783,35 @@ index 201d48c..0c2ec14 100644
  };
  
  struct llama_hparams;
+@@ -97,6 +101,8 @@ struct llama_batch_ext {
+         bool         output = false; // TODO: have dedicated output flags
+         std::unordered_set<llama_seq_id> seq_ids;
+         std::array<llama_pos, GGML_MROPE_SECTIONS> pos = {0, 0, 0, 0};
++        llama_pos     logical_pos = -1;      // KVMem: logical cache-row ID independent of the M-RoPE planes (-1 = unset)
++        const float * nextn       = nullptr; // KVMem: MTP hidden input row for this token (caller-owned until init)
+     };
+     std::vector<token> tokens;
+     std::vector<float> embd;
+@@ -123,6 +129,8 @@ struct llama_batch_ext {
+     bool set_token_id(int32_t idx, llama_token id);
+     bool set_token_embd(int32_t idx, llama_embd embd_in);
+     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
++    bool set_token_logical(int32_t idx, llama_pos logical);              // KVMem
++    bool set_token_nextn(int32_t idx, const float * row);                // KVMem
+     bool set_output(int32_t idx, bool output_last);
+ };
+ 
+@@ -193,6 +201,8 @@ private:
+ 
+     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
+     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
++    std::vector<llama_pos>      logical_vec;  // KVMem: owned logical cache-row IDs (see init)
++    std::vector<float>          nextn_vec;    // KVMem: owned MTP hidden rows (see init)
+     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
+ 
+     std::vector<llama_pos>      pos;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 8675f60..cf28656 100644
+index 88851c6..69c44b3 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -12,6 +12,9 @@
@@ -726,7 +837,7 @@ index 8675f60..cf28656 100644
      // TODO: more generic
      if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
          if (params.ctx_other == nullptr) {
-@@ -1402,7 +1411,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1407,7 +1416,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
      const auto gparams = graph_params(res, ubatch, mctx, gtype);
  
@@ -740,7 +851,7 @@ index 8675f60..cf28656 100644
          //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
  
          // with pipeline parallelism, the previous graph_compute_async may still be running
-@@ -1422,6 +1436,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1427,6 +1441,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
  
          //const auto t_start_us = ggml_time_us();
  
@@ -750,7 +861,7 @@ index 8675f60..cf28656 100644
          gf = model.build_graph(gparams);
  
          //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-@@ -1458,6 +1475,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1463,6 +1480,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
@@ -762,7 +873,7 @@ index 8675f60..cf28656 100644
  
      return res;
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 0b3bab6..93f59b3 100644
+index a806126..fe42cae 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -15,6 +15,9 @@
@@ -923,7 +1034,7 @@ index 3daa425..bbe89cc 100644
      // common
      //
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 332d1ab..ecd5d33 100644
+index 1c93f90..210cc8c 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -379,6 +379,31 @@ void llama_kv_cache::clear(bool data) {
@@ -1091,7 +1202,7 @@ index 332d1ab..ecd5d33 100644
      }
  }
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index c4d8699..5850e09 100644
+index 5051f43..25a31c0 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -165,8 +165,10 @@ public:
@@ -1134,8 +1245,30 @@ index 5d567a6..566b46b 100644
      // note: call only if the cell is not empty
      llama_pos pos_get(uint32_t i) const {
          assert(i < pos.size());
+diff --git a/src/llama-kvmem-factory.h b/src/llama-kvmem-factory.h
+new file mode 100644
+index 0000000..8493b3e
+--- /dev/null
++++ b/src/llama-kvmem-factory.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++// Thin hook used by llama_model::create_memory when LLAMA_KVMEM is enabled.
++// Implementation lives out-of-tree in src/adapter/.
++
++struct llama_memory_i;
++struct llama_model;
++struct llama_memory_params;
++struct llama_cparams;
++
++#if defined(LLAMA_KVMEM)
++llama_memory_i * llama_memory_kvmem_maybe_create(
++        const llama_model & model,
++        const llama_memory_params & params,
++        const llama_cparams & cparams);
++#endif
 diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
-index 42c7381..35aab9e 100644
+index 62f12de..b4ace58 100644
 --- a/src/llama-memory-hybrid.cpp
 +++ b/src/llama-memory-hybrid.cpp
 @@ -29,7 +29,8 @@ llama_memory_hybrid::llama_memory_hybrid(
@@ -1173,7 +1306,7 @@ index 484eafb..488c7a1 100644
      ~llama_memory_hybrid() = default;
  
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index 57919ac..50843b6 100644
+index 528c90c..ddc221a 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
 @@ -25,14 +25,19 @@ llama_memory_recurrent::llama_memory_recurrent(
@@ -1300,7 +1433,7 @@ index 57919ac..50843b6 100644
  }
  
  void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
-@@ -1291,6 +1322,48 @@ uint32_t llama_memory_recurrent_context::get_size() const {
+@@ -1331,6 +1362,48 @@ uint32_t llama_memory_recurrent_context::get_size() const {
      return mem->size;
  }
  
@@ -1350,7 +1483,7 @@ index 57919ac..50843b6 100644
      return mem->r_l[il];
  }
 diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
-index 4abb3f5..fda92db 100644
+index 25ade10..3b06026 100644
 --- a/src/llama-memory-recurrent.h
 +++ b/src/llama-memory-recurrent.h
 @@ -5,6 +5,7 @@
@@ -1398,7 +1531,7 @@ index 4abb3f5..fda92db 100644
      // per layer
      std::vector<ggml_tensor *> r_l;
      std::vector<ggml_tensor *> s_l;
-@@ -170,6 +185,9 @@ public:
+@@ -172,6 +187,9 @@ public:
      uint32_t get_head() const;
      int32_t  get_rs_z() const;
      uint32_t get_size() const;
@@ -1604,10 +1737,10 @@ index a1e2635..df20fc1 100644
      Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
              n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 6527049..faa653c 100644
+index 17ac9da..4dc92d0 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11677,6 +11677,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11726,6 +11726,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
  
      // GATED_DELTA_NET: realistic model configurations
@@ -1820,7 +1953,7 @@ index 2ff790a..e0533fe 100644
  
      common_chat_templates_inputs inputs;
 diff --git a/tools/server/server-common.h b/tools/server/server-common.h
-index 9894f5f..2fed312 100644
+index e00408c..325ab3a 100644
 --- a/tools/server/server-common.h
 +++ b/tools/server/server-common.h
 @@ -325,6 +325,9 @@ struct server_chat_params {

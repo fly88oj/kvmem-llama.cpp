@@ -30,11 +30,11 @@ stage 的同名 DLL 一并带上保证自包含。
 #    双轨构建总览与逐轨注意事项见 docs/amd-hip-port.md §5“Two build tracks”
 powershell scripts/windows/build-hip.ps1 -LmsShared -BuildDir build-hip-lms
 
-# ② 打包并安装（克隆官方 2.46.0 → 覆盖 → manifest 版本自动 bump 到 2.46.1）
+# ② 打包并安装（克隆官方 2.47.0 → 覆盖 → manifest 版本自动 bump 到 2.47.1）
 powershell scripts/windows/make-lms-extension.ps1 -Install
 
 # ③ 选择引擎（或 LM Studio 里 Ctrl+Shift+R）
-lms runtime select "llama.cpp-win-x86_64-amd-rocm-avx2@2.46.1"
+lms runtime select "llama.cpp-win-x86_64-amd-rocm-avx2@2.47.1"
 ```
 
 配套的必要修改（都在仓库内）：
@@ -100,7 +100,8 @@ setx KVMEM_BLOCK_TOKENS 128;  setx KVMEM_CPU_GB 4;  setx KVMEM_NVME_GB 2
   LM Studio 默认传 `--flash-attn off --cache-type-k/v f16`，该组合会触发
   rocBLAS 的 Tensile GEMM 路径，而 **gfx1201 缺预编译 Tensile 库**（上游已知
   gap；实测官方 ROCm 2.41.0 包在同样参数下同样 0xC0000409 启动即崩——非本
-  pack 问题；官方 2.46.0 亦未随包提供 gfx1201 Tensile 库，该要求保持不变）。
+  pack 问题；官方 2.46.0 亦未随包提供 gfx1201 Tensile 库，2.47.0 未复验——
+  该要求保持不变）。
   FA on + q8_0 同时避开该路径并匹配 KVMem 最优实测配方
   （pack 上验证：40K prompt 131K ctx 预填 2125 t/s、decode 55.6 t/s、完整
   needle 命中无崩溃）。
@@ -117,8 +118,8 @@ setx KVMEM_BLOCK_TOKENS 128;  setx KVMEM_CPU_GB 4;  setx KVMEM_NVME_GB 2
 
 | 检查 | 结果 |
 |---|---|
-| `lms runtime ls` 列出并可选 2.41.1（b81c99b 基线）/ 2.46.1（b11189 同步升级） | ✓ |
-| app 日志 `LLM model loaded ... 2.46.1` | ✓ 27B IQ3_S `-c 262144 --no-speculative-draft-mtp` 100% 加载，server 来自 2.46.1 pack 目录 |
+| `lms runtime ls` 列出并可选 2.41.1（b81c99b）/ 2.46.1（b11189）/ **2.47.1（b11235，当前）** | ✓ |
+| app 日志 `LLM model loaded ... 2.47.1` | ✓ 27B IQ3_S `-c 262144 --parallel 1 --no-speculative-draft-mtp` 100% 加载，server 来自 2.47.1 pack 目录（`fa=on kkv=q8_0`），`/v1/chat/completions` 正确应答，freeRAM 健康 |
 | server 进程 = pack 目录的 `llama-server.exe`（engine protocol 拉起） | ✓ |
 | `KVMEM_*` env 生效（修复后真实直证） | ✓ 手工同参全量：`KVMEM_TIERS cpu_slots=3855 nvme_slots=1927 slot_bytes=1114112`（managed 布局）+ `%TEMP%\kvmem_nvme` 创建 |
 | 40K prompt 端到端（llama-server 直连，FA on + q8_0） | ✓ prefill 2125 t/s、decode 55.6 t/s、正常释放无崩溃 |

@@ -31,13 +31,13 @@ if (-not (Test-Path (Join-Path $bin 'llama-server.exe'))) {
 $backendsRoot = Join-Path $env:USERPROFILE '.lmstudio\extensions\backends'
 if (-not $TemplateBackend) {
     # Version-aware pick. The pack must be built against the llama.cpp release
-    # the chosen official engine layer ships with (currently b11189 ==
-    # official 2.46.x, per docs/lmstudio-runtime-packaging.md); the kept
+    # the chosen official engine layer ships with (currently b11235 ==
+    # official 2.47.x, per docs/lmstudio-runtime-packaging.md); the kept
     # official plugin DLLs (ggml-*.dll, ggml_llamacpp.dll) must come from the
     # same family as the pack base. Bump $templateFamily together with the
     # submodule pin; other versions need an explicit -TemplateBackend after
     # re-validating the ABI pair by hand.
-    $templateFamily = '2.46'
+    $templateFamily = '2.47'
     $excludeSelf = "*-$templateFamily.1"
     $cands = Get-ChildItem $backendsRoot -Directory -Filter 'llama.cpp-win-x86_64-amd-rocm-avx2-*' |
         Where-Object { $_.Name -notlike $excludeSelf -and $_.Name -match '-(\d+\.\d+\.\d+)$' -and

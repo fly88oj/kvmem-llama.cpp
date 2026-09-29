@@ -35,8 +35,8 @@ will differ on other hardware, drivers, or OS builds.
 ## 2. What the port changes
 
 All changes live **in this repository** (the `kvmem/` policy library is untouched).
-The `llama.cpp` submodule stays at pin `a25c986` (tag `b11189`, synced with the
-LM Studio official ROCm runtime 2.46.0); the port is delivered as patches
+The `llama.cpp` submodule stays at pin `6c7a87f` (tag `b11235`, synced with the
+LM Studio official ROCm runtime 2.47.0); the port is delivered as patches
 plus out-of-tree files so a vanilla submodule build stays bit-identical to upstream.
 
 | File | Purpose |
@@ -131,7 +131,7 @@ Products: `build-hip\bin\Release\llama-kvmem-server.exe` and `llama-kvmem-cli.ex
 | Track | Command | Products | Use |
 |---|---|---|---|
 | **Static KVMem tree** (default) | `build-hip.ps1 [-BuildDir build-hip]` | `llama-kvmem-server.exe`, `llama-kvmem-cli.exe`, full ctest (13 tests) | Standalone OpenAI-compatible server / CLI: all `--kvmem-*` flags, MTP (`--spec-type draft-mtp`), NVMe tier, Web UI |
-| **LM Studio shared tree** | `build-hip.ps1 -LmsShared -BuildDir build-lms` | `llama.dll`, stock `llama-server.exe`, unified `ggml*.dll` set | Input for `make-lms-extension.ps1` → the `llama.cpp-win-x86_64-amd-rocm-avx2@2.46.1` engine pack ([packaging doc](lmstudio-runtime-packaging.md)) |
+| **LM Studio shared tree** | `build-hip.ps1 -LmsShared -BuildDir build-lms` | `llama.dll`, stock `llama-server.exe`, unified `ggml*.dll` set | Input for `make-lms-extension.ps1` → the `llama.cpp-win-x86_64-amd-rocm-avx2@2.47.1` engine pack ([packaging doc](lmstudio-runtime-packaging.md)) |
 
 Per-track runtime notes:
 
@@ -152,7 +152,7 @@ Per-track runtime notes:
 - `llama-kvmem-cli` does not accept `-fa`/`--flash-attn` (FA follows the backend
   default); `llama-kvmem-server` does accept `--flash-attn on|off|auto`.
 - LM Studio track additionally requires: an installed official ROCm template
-  pack of the matching family (currently 2.46.x — `make-lms-extension.ps1`
+  pack of the matching family (currently 2.47.x — `make-lms-extension.ps1`
   clones it), Parallel=1 / FA on / KV 8-bit / app-MTP off in the app, and
   disabled extension-pack auto-update (packaging doc §4).
 - After any submodule pin bump, rebuild the Web UI
@@ -226,14 +226,14 @@ tree exactly. **Reproduce** (bash; see [`patches/README.md`](../patches/README.m
 
 ```bash
 tmp=$(mktemp -d)
-git -C llama.cpp archive a25c986 | tar -x -C "$tmp"
+git -C llama.cpp archive 6c7a87f | tar -x -C "$tmp"
 git -C "$tmp" init -q
 git -C "$tmp" apply patches/llama-kvmem-current.patch     # cumulative KVMem base
 git -C "$tmp" apply patches/kvmem-hip-port-cmake.patch    # HIP cmake delta
 git diff --no-index llama.cpp/src "$tmp/src"              # expect: no output
 ```
 
-**Result:** the cumulative patch applies cleanly to the pristine pin `a25c986`,
+**Result:** the cumulative patch applies cleanly to the pristine pin `6c7a87f`,
 the HIP delta applies on top, and the replayed tree is **byte-identical** to the
 working tree (verified across `llama-kv-cache.cpp`, `llama-kv-cells.h`,
 `llama-graph.cpp`, `speculative.cpp`, `llama-model.cpp`, `src/CMakeLists.txt`).
@@ -332,7 +332,7 @@ the second run is reported. Metrics: `KVMEM_PERF prompt_toks` (prefill) and
 | A7/B | q8_0 K + q4_0 V | flags | 3213 | 86.2 | 5720 | YES | ➖ fallback (VRAM-tight; single quality sample) |
 | B | `GGML_HIP_NO_VMM=OFF` + `NATIVE=ON` | rebuild | 1537 | 72.1 | 5819 | YES | ❌ **VMM harmful: f16 prefill −52%** |
 | C | `GGML_CUDA_FORCE_CUBLAS=ON` | rebuild | 658 | 72.6 | 6200 | YES* | ❌ **−80% prefill + rocBLAS errors** |
-| — | hipBLASLt (`GGML_HIPBLAS`) | rebuild | — | — | — | — | 🚫 excluded: pin `b81c99b` had no integration at decision time (now at `a25c986`; not re-measured) |
+| — | hipBLASLt (`GGML_HIPBLAS`) | rebuild | — | — | — | — | 🚫 excluded: pin `b81c99b` had no integration at decision time (now at `b11235`; not re-measured) |
 | — | FA on/off | flags | — | — | — | — | 🚫 excluded: code evidence — q8_0 V requires FA enabled (`llama-context.cpp`); `auto` already does this |
 | — | thread `-t` tuning | flags | — | — | — | — | 🚫 excluded: with `-ngl 99` full offload the CPU only samples; B2 vs A2 differ <2% (noise) |
 
@@ -426,7 +426,7 @@ are low-value here (their measured ceiling is <=1.5% of a one-time path).
   WMMA cannot fill its 16-wide tile at effective batch 8, and decode is
   memory-bandwidth-bound regardless. The newer-llama.cpp `GGML_HIP_ROCWMMA_FATTN`
   flag is redundant here - the path is arch-gated and already on
-  for RDNA4 (true at `b81c99b` and still true at `a25c986`). So the biggest suspected lever is already exploited; no headroom.
+  for RDNA4 (true at `b81c99b` and still true at `b11235`). So the biggest suspected lever is already exploited; no headroom.
 - **rocBLAS/Tensile gfx1201 kernels**: the wheel's rocBLAS lacks gfx1201 Tensile
   dispatch (why `FORCE_CUBLAS` measured -80% prefill); no community prebuilt logic
   pack covers gfx1201 yet (only <=gfx1150), so mmq is the active matmul path.
@@ -630,3 +630,32 @@ needle HIT, gemma4 KVMem/stock runs, Qwen3.8-27B IQ3_S 40K @256K no crash; the
 **LM Studio usage reminder** (details in the packaging doc): Parallel=1, Flash
 Attention on, KV 8-bit, app-level MTP off — the 2.43+ runtimes default
 Parallel to 4, which bypasses KVMem entirely and exhausts host RAM at 256K.
+
+---
+
+## 14. Upstream sync to b11235 / LM Studio runtime 2.47.1 (2026-09-30)
+
+Pin moved `a25c986` (b11189) → `6c7a87f` (tag `b11235`), matching LM Studio's
+official ROCm runtime 2.47.0; the KVMem pack is issued as **2.47.1**.
+
+- The cumulative patch replayed onto b11235 **conflict-free**; only the HIP
+  cmake delta needed regeneration (line drift, handled by `emit-hip-patch.py`).
+- **Fixed an incomplete patch shipped in the b11189 sync**: the batch-ext port
+  (`logical_pos`/`embd_nextn` through `llama_batch_ext`) and the new file
+  `src/llama-kvmem-factory.h` had not made it into the committed cumulative
+  patch (verified on a dirty worktree only). Both are now in the patch, and a
+  **clean-tree replay check** (pristine `git archive` of the pin + cumulative +
+  delta → byte-identical to the worktree) is now part of every pin bump —
+  untracked new files require `git add -N` before regenerating the diff.
+- New-base behavior notes: stock `llama-cli` no longer prints completion text
+  to redirected stdout, and the server dropped the legacy `/completion`
+  endpoint (use `/v1/chat/completions`); KVMem consistency checks now run
+  through the server API.
+
+Validation on b11235: static tree 98/98 + ctest 13/13; clean-tree replay
+byte-identical; LmsShared tree first-pass link; hardware regression —
+Qwopus-9B MTP 128K needle HIT, gemma4 stock-vs-KVMem server outputs identical,
+Qwen3.8-27B IQ3_S 40K @256K no crash; 2.47.1 pack loads the 27B at `-c 262144
+--parallel 1 --no-speculative-draft-mtp` and answers correctly (`fa=on`,
+`kkv=q8_0`, free RAM healthy). Web UI rebuilt on the new baseline
+(`build-webui.py`) and served HTTP 200 from the static server.

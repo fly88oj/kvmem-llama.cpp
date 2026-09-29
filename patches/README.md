@@ -1,7 +1,7 @@
 # llama.cpp patch replay
 
-`llama-kvmem-current.patch` is the cumulative diff against pinned `a25c986` (tag `b11189`,
-the llama.cpp release LM Studio's official ROCm runtime 2.46.0 ships).
+`llama-kvmem-current.patch` is the cumulative diff against pinned `6c7a87f` (tag `b11235`,
+the llama.cpp release LM Studio's official ROCm runtime 2.47.0 ships).
 It includes the existing KVMem hooks, multimodal batch, MTP, media
 parser and mtmd helper extensions, plus FP32 GDN Record/Fold for ReplaySSM.
 It also fixes reasoning-budget initialization from a template's generation prefix,
@@ -37,7 +37,7 @@ To check a clean extraction without changing the active submodule:
 
 ```bash
 mkdir -p /tmp/kvmem-llama-patch-check
-git -C llama.cpp archive a25c986 | tar -x -C /tmp/kvmem-llama-patch-check
+git -C llama.cpp archive 6c7a87f | tar -x -C /tmp/kvmem-llama-patch-check
 KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
 KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
 ```
