@@ -35,7 +35,8 @@ will differ on other hardware, drivers, or OS builds.
 ## 2. What the port changes
 
 All changes live **in this repository** (the `kvmem/` policy library is untouched).
-The `llama.cpp` submodule stays at pin `b81c99b`; the port is delivered as patches
+The `llama.cpp` submodule stays at pin `a25c986` (tag `b11189`, synced with the
+LM Studio official ROCm runtime 2.46.0); the port is delivered as patches
 plus out-of-tree files so a vanilla submodule build stays bit-identical to upstream.
 
 | File | Purpose |
@@ -43,7 +44,7 @@ plus out-of-tree files so a vanilla submodule build stays bit-identical to upstr
 | `compat/hipify/cuda_runtime.h`, `cuda_fp16.h`, `cuda_bf16.h` | Forward the CUDA header names to their HIP equivalents. Only the HIP configure puts this dir on the include path, so CUDA builds are unaffected. |
 | `compat/hipify/kvmem_hip_defs.h` | Maps every `cuda*` symbol used by `src/adapter/*` and the stage-in kernel onto `hip*` (mirrors ggml's `vendors/hip.h`, and fills gaps such as `cudaHostAlloc` and `cudaPointerAttributes`). Each define is `#ifndef`-guarded so it can coexist with `vendors/hip.h`. |
 | `llama.cpp/src/CMakeLists.txt` (via `patches/kvmem-hip-port-cmake.patch`) | The `GGML_HIP` branch: compiles `llama-kvmem-stagein.cu` with ROCm clang (Windows: `LANGUAGE CXX` + `hip::device`; Linux: native `LANGUAGE HIP`), and injects the compat include dir. |
-| `patches/llama-kvmem-current.patch` | The cumulative KVMem feature diff vs the pin (memory tiers, MTP, multimodal, reasoning budget, GDN kernels). Backend-agnostic; shared with the CUDA build. |
+| `patches/llama-kvmem-current.patch` | The cumulative KVMem feature diff vs the pin (memory tiers, MTP, multimodal, reasoning budget, GDN kernels, interleaved-SWA gemma3/gemma4 support incl. QAT, and the `logical_pos`/`embd_nextn` channel across the b111xx `llama_batch_ext` architecture). Backend-agnostic; shared with the CUDA build. |
 | `scripts/windows/rocm-install.ps1` | Installs the ROCm wheel (`pip --index-url https://repo.amd.com/rocm/whl-multi-arch/ rocm[libraries,devel]==7.14.0` + `rocm-sdk init`). Same method as llama.cpp's official `windows-setup-rocm` action. |
 | `scripts/windows/patch-rocm-headers.py` | Idempotent fix for a ROCm-on-Windows toolchain bug (llama.cpp issue #22570: MSVC 14.5x `<cmath>` collides with clang's HIP math forward-declares for `isgreater`/`isless`/…). Guarded by `KVMEM_HIP_SKIP_MATH_FWD`; the build script enables it. |
 | `scripts/windows/revert-guards.py` | Cleanly reverses `patch-rocm-headers.py` for **both** patched clang headers. |
@@ -192,14 +193,14 @@ tree exactly. **Reproduce** (bash; see [`patches/README.md`](../patches/README.m
 
 ```bash
 tmp=$(mktemp -d)
-git -C llama.cpp archive b81c99b | tar -x -C "$tmp"
+git -C llama.cpp archive a25c986 | tar -x -C "$tmp"
 git -C "$tmp" init -q
 git -C "$tmp" apply patches/llama-kvmem-current.patch     # cumulative KVMem base
 git -C "$tmp" apply patches/kvmem-hip-port-cmake.patch    # HIP cmake delta
 git diff --no-index llama.cpp/src "$tmp/src"              # expect: no output
 ```
 
-**Result:** the cumulative patch applies cleanly to the pristine pin `b81c99b`,
+**Result:** the cumulative patch applies cleanly to the pristine pin `a25c986`,
 the HIP delta applies on top, and the replayed tree is **byte-identical** to the
 working tree (verified across `llama-kv-cache.cpp`, `llama-kv-cells.h`,
 `llama-graph.cpp`, `speculative.cpp`, `llama-model.cpp`, `src/CMakeLists.txt`).
@@ -298,7 +299,7 @@ the second run is reported. Metrics: `KVMEM_PERF prompt_toks` (prefill) and
 | A7/B | q8_0 K + q4_0 V | flags | 3213 | 86.2 | 5720 | YES | ➖ fallback (VRAM-tight; single quality sample) |
 | B | `GGML_HIP_NO_VMM=OFF` + `NATIVE=ON` | rebuild | 1537 | 72.1 | 5819 | YES | ❌ **VMM harmful: f16 prefill −52%** |
 | C | `GGML_CUDA_FORCE_CUBLAS=ON` | rebuild | 658 | 72.6 | 6200 | YES* | ❌ **−80% prefill + rocBLAS errors** |
-| — | hipBLASLt (`GGML_HIPBLAS`) | rebuild | — | — | — | — | 🚫 excluded: pin `b81c99b` has no integration; bumping the pin breaks the fork's patch anchors |
+| — | hipBLASLt (`GGML_HIPBLAS`) | rebuild | — | — | — | — | 🚫 excluded: pin `b81c99b` had no integration at decision time (now at `a25c986`; not re-measured) |
 | — | FA on/off | flags | — | — | — | — | 🚫 excluded: code evidence — q8_0 V requires FA enabled (`llama-context.cpp`); `auto` already does this |
 | — | thread `-t` tuning | flags | — | — | — | — | 🚫 excluded: with `-ngl 99` full offload the CPU only samples; B2 vs A2 differ <2% (noise) |
 
@@ -391,8 +392,8 @@ are low-value here (their measured ceiling is <=1.5% of a one-time path).
   `gqa_ratio_eff=8`, product 8, not > 8) it correctly uses the tile/vec kernel:
   WMMA cannot fill its 16-wide tile at effective batch 8, and decode is
   memory-bandwidth-bound regardless. The newer-llama.cpp `GGML_HIP_ROCWMMA_FATTN`
-  flag is redundant here - at pin `b81c99b` the path is arch-gated and already on
-  for RDNA4. So the biggest suspected lever is already exploited; no headroom.
+  flag is redundant here - the path is arch-gated and already on
+  for RDNA4 (true at `b81c99b` and still true at `a25c986`). So the biggest suspected lever is already exploited; no headroom.
 - **rocBLAS/Tensile gfx1201 kernels**: the wheel's rocBLAS lacks gfx1201 Tensile
   dispatch (why `FORCE_CUBLAS` measured -80% prefill); no community prebuilt logic
   pack covers gfx1201 yet (only <=gfx1150), so mmq is the active matmul path.
@@ -547,8 +548,52 @@ Notable fixes, all reflected in `patches/llama-kvmem-current.patch`:
 ## 12. Further reading
 
 - [`README.md`](../README.md) — project overview (CUDA), KVMem design, server API.
+- [`docs/lmstudio-runtime-packaging.md`](lmstudio-runtime-packaging.md) — LM Studio runtime extension pack (2.46.1), env channel and required GUI settings.
+- [`docs/kvmem-performance-comparison.md`](kvmem-performance-comparison.md) — KVMem vs stock performance matrix incl. gemma4 SWA results.
 - [`scripts/windows/README.md`](../scripts/windows/README.md) — Windows CUDA build/run/validation.
 - [`patches/README.md`](../patches/README.md) — patch-replay mechanics.
 - [`docs/architecture.md`](architecture.md) — KVMem architecture.
 - [`docs/deep-research-amd-rdna4-port.md`](deep-research-amd-rdna4-port.md) — the research that preceded this port.
 - KVMem upstream Issue #44 (AMD ROCm/HIP adaptation) tracks community interest.
+
+---
+
+## 13. Upstream sync to b11189 / LM Studio runtime 2.46.1 (2026-09-29)
+
+The submodule pin moved `b81c99b` → `a25c986` (tag `b11189`) to match the
+llama.cpp release shipped by LM Studio's official ROCm runtime 2.46.0, so the
+KVMem pack and the official engine layer now share one baseline.
+
+Rebase notes (all conflicts resolved semantically, both sides' intent kept):
+
+- **`llama_batch_ext` architecture port (functional, not cosmetic).** Upstream
+  b111xx moved `llama_batch_allocr::init` to consume a builder-style
+  `llama_batch_ext` (with `llama_batch_compat` converting public batches). The
+  KVMem `logical_pos` / `embd_nextn` channel (query replay row mapping,
+  multimodal MTP hidden rows) would silently lose its data source; ported by
+  adding the fields + setters to `llama_batch_ext`, copying them into owned
+  vectors in `init`, and forwarding them in the compat converter.
+- **`src/CMakeLists.txt` integration block recovered.** The shared `LLAMA_KVMEM`
+  block previously lived only in the developer worktree (accidentally excluded
+  when the cumulative patch was regenerated). It now belongs to the cumulative
+  patch; the HIP-only increments stay in `kvmem-hip-port-cmake.patch`
+  (regenerated via `emit-hip-patch.py`).
+- **UNITY_BUILD.** New-base llama core enables unity builds; the six adapter
+  sources get `SKIP_UNITY_BUILD_INCLUSION` so their file-local state stays
+  separate.
+- `speculative.cpp` draft positions renamed `n_past`→`pos0` upstream; our
+  `logical_pos` assignments kept with `pos0` fallbacks. `qwen35.cpp` K/V
+  construction collapsed into `build_qkv` upstream; only `kvmem_capture_q`
+  survives (K capture stays at the norm-after site). Graph-reuse merged
+  upstream's `gf_res_prev_active == res` precondition with our
+  `kvmem_capture_can_reuse` guard. `server-common.cpp` process_media extraction
+  restored and upstream's empty-schema-means-any-object logic re-applied.
+
+Validation on this pin: static tree 98/98 + ctest 13/13; `-LmsShared` tree
+links first pass; hardware regression on b11189 binaries — Qwopus-9B MTP 128K
+needle HIT, gemma4 KVMem/stock runs, Qwen3.8-27B IQ3_S 40K @256K no crash; the
+2.46.1 pack loads the 27B at `-c 262144` (MTP off) through LM Studio.
+
+**LM Studio usage reminder** (details in the packaging doc): Parallel=1, Flash
+Attention on, KV 8-bit, app-level MTP off — the 2.43+ runtimes default
+Parallel to 4, which bypasses KVMem entirely and exhausts host RAM at 256K.

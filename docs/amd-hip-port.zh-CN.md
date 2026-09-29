@@ -32,7 +32,7 @@
 ## 2. 移植改动清单
 
 所有改动都在**本仓库内**（未改动 `kvmem/` 策略库）。`llama.cpp` 子模块保持在 pin
-`b81c99b`；移植以“补丁 + 树外文件”交付，因此未打补丁的纯净子模块构建与上游逐位一致。
+`a25c986`（tag `b11189`，与 LM Studio 官方 ROCm runtime 2.46.0 同源）；移植以“补丁 + 树外文件”交付，因此未打补丁的纯净子模块构建与上游逐位一致。
 
 | 文件 | 作用 |
 |---|---|
@@ -184,14 +184,14 @@ runtime 测试输出结构化诊断，如
 
 ```bash
 tmp=$(mktemp -d)
-git -C llama.cpp archive b81c99b | tar -x -C "$tmp"
+git -C llama.cpp archive a25c986 | tar -x -C "$tmp"
 git -C "$tmp" init -q
 git -C "$tmp" apply patches/llama-kvmem-current.patch     # KVMem 累积基线
 git -C "$tmp" apply patches/kvmem-hip-port-cmake.patch    # HIP cmake delta
 git diff --no-index llama.cpp/src "$tmp/src"              # 期望：无输出
 ```
 
-**结果：** 累积补丁可干净地应用到纯净 pin `b81c99b`，HIP delta 叠加其上，重放出的树与
+**结果：** 累积补丁可干净地应用到纯净 pin `a25c986`，HIP delta 叠加其上，重放出的树与
 工作树**逐字节一致**（已核对 `llama-kv-cache.cpp`、`llama-kv-cells.h`、
 `llama-graph.cpp`、`speculative.cpp`、`llama-model.cpp`、`src/CMakeLists.txt`）。基线补丁
 不含 HIP，HIP 接线隔离在 delta 补丁中。
@@ -279,7 +279,7 @@ gen_reserve=1024、block=128、CPU arena 12 GiB。档位名是 `-c` 配置，真
 | A7/B | q8_0 K + q4_0 V | 参数 | 3213 | 86.2 | 5720 | YES | ➖ 备选（显存敏感时；质量样本单一） |
 | B | `GGML_HIP_NO_VMM=OFF` + `NATIVE=ON` | 重编译 | 1537 | 72.1 | 5819 | YES | ❌ **VMM 有害：f16 prefill −52%** |
 | C | `GGML_CUDA_FORCE_CUBLAS=ON` | 重编译 | 658 | 72.6 | 6200 | YES* | ❌ **−80% prefill + rocBLAS 错误** |
-| — | hipBLASLt（`GGML_HIPBLAS`） | 重编译 | — | — | — | — | 🚫 排除：pin `b81c99b` 无集成，升 pin 会破坏 fork 补丁锚点 |
+| — | hipBLASLt（`GGML_HIPBLAS`） | 重编译 | — | — | — | — | 🚫 排除：决策时 pin `b81c99b` 无集成（现已升 `a25c986`，未重测） |
 | — | FA on/off | 参数 | — | — | — | — | 🚫 排除：代码证据——q8_0 V 强制要求 FA enabled（`llama-context.cpp`），`auto` 已生效 |
 | — | 线程 `-t` 调优 | 参数 | — | — | — | — | 🚫 排除：`-ngl 99` 全卸载下 CPU 仅采样；B2 vs A2 差异 <2%（噪声） |
 
@@ -357,8 +357,8 @@ prefill 更快——KVMem 用于 >=30K。检索重排（`layout_d2h` + `layout_h
   在 **prefill**（`Q->ne[1]` 大）时为 gfx1201 返回 `BEST_FATTN_KERNEL_MMA_F16`。
   **decode**（`Q->ne[1]=1`、`gqa_ratio_eff=8`、乘积 8，不 >8）则正确地用 tile/vec 内核：
   WMMA 在有效 batch 8 时填不满 16 宽 tile，且 decode 本就受显存带宽限制。新版
-  llama.cpp 的 `GGML_HIP_ROCWMMA_FATTN` 开关在此多余——pin `b81c99b` 下该路径按 arch
-  门控、RDNA4 已自动启用。所以最大的疑似杆杆已被利用，无额外空间。
+  llama.cpp 的 `GGML_HIP_ROCWMMA_FATTN` 开关在此多余——该路径按 arch
+  门控、RDNA4 已自动启用（`b81c99b` 与 `a25c986` 均如此）。所以最大的疑似杆杆已被利用，无额外空间。
 - **rocBLAS/Tensile gfx1201 内核**：wheel 的 rocBLAS 缺 gfx1201 的 Tensile 分发（所以
   `FORCE_CUBLAS` 实测 -80% prefill）；目前无社区预编译 logic 包覆盖 gfx1201（仅 <=gfx1150），
   故 mmq 是当前矩阵乘路径。自行为 gfx1201 调优 Tensile 是剩下唯一的大 prefill 杆杆，
@@ -487,8 +487,44 @@ git -C llama.cpp apply ../patches/kvmem-hip-port-cmake.patch
 ## 12. 延伸阅读
 
 - [`README.md`](../README.md)——项目总览（CUDA）、KVMem 设计、服务器 API。
+- [`docs/lmstudio-runtime-packaging.md`](lmstudio-runtime-packaging.md)——LM Studio runtime 扩展包（2.46.1）、env 通道与必设 GUI 配置。
+- [`docs/kvmem-performance-comparison.md`](kvmem-performance-comparison.md)——KVMem vs stock 性能矩阵（含 gemma4 SWA 结果）。
 - [`scripts/windows/README.md`](../scripts/windows/README.md)——Windows CUDA 构建/运行/验证。
 - [`patches/README.md`](../patches/README.md)——补丁重放机制。
 - [`docs/architecture.md`](architecture.md)——KVMem 架构。
 - [`docs/deep-research-amd-rdna4-port.md`](deep-research-amd-rdna4-port.md)——本移植前的深度调研。
 - KVMem 上游 Issue #44（AMD ROCm/HIP 适配）跟踪社区需求。
+
+---
+
+## 13. 上游同步到 b11189 / LM Studio runtime 2.46.1（2026-09-29）
+
+子模块 pin 从 `b81c99b` 升到 `a25c986`（tag `b11189`），与 LM Studio 官方 ROCm
+runtime 2.46.0 同源——KVMem 扩展包与官方引擎层现在共享同一 llama.cpp 基线。
+
+Rebase 要点（全部冲突按语义解决，双方意图均保留）：
+
+- **`llama_batch_ext` 架构端口（功能性适配，非表面改动）**：上游 b111xx 把
+  `llama_batch_allocr::init` 改为消费 builder 风格 `llama_batch_ext`（public
+  batch 经 `llama_batch_compat` 转换）。KVMem 的 `logical_pos`/`embd_nextn`
+  通道（query-replay 行映射、多模态 MTP hidden 行）会静默失去数据源；已端口：
+  ext token 补字段+setter、init 拷进 owned vector、compat 转换透传。
+- **`src/CMakeLists.txt` 集成块归位**：共享的 `LLAMA_KVMEM` 块此前只存活于开发
+  工作树（重生成累积补丁时被误排除），本次归位进累积补丁；HIP 专属增量仍在
+  `kvmem-hip-port-cmake.patch`（emit-hip-patch.py 重生成）。
+- **UNITY_BUILD**：新 base 的 llama 核心启用 unity 构建，6 个 adapter 源文件加
+  `SKIP_UNITY_BUILD_INCLUSION` 防止文件局部状态被合入同一 TU。
+- `speculative.cpp`：上游 `n_past`→`pos0` 改名，我方 `logical_pos` 赋值保留并以
+  `pos0` 作 fallback；`qwen35.cpp`：上游收敛到 `build_qkv`，仅保留
+  `kvmem_capture_q`（K capture 仍在 norm 后位置）；graph-reuse 合并上游新前置
+  条件与我方 `kvmem_capture_can_reuse` guard；`server-common.cpp` 复原
+  process_media 拆分并补回上游新增的 empty-schema 逻辑。
+
+验证（新 pin）：静态树 98/98 + ctest 13/13；`-LmsShared` 树一次链接通过；真机
+回归 b11189 二进制——Qwopus-9B MTP 128K needle HIT、gemma4 KVMem/stock 对照、
+Qwen3.8-27B IQ3_S 40K@256K 无崩；2.46.1 pack 经 LM Studio 加载 27B `-c 262144`
+（关 MTP）100% 成功。
+
+**LM Studio 使用提醒**（详见打包文档）：Parallel=1、Flash Attention on、KV
+8-bit、关闭 app 级 MTP——2.43+ 的 runtime 默认 Parallel=4，会整体旁路 KVMem，
+256K 下直接把主机内存打满。

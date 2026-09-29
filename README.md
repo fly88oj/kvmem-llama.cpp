@@ -5,8 +5,10 @@
 **QQ community / QQ 交流群：1040777853**
 
 > **AMD GPU (HIP/ROCm) port.** This tree adds a native AMD backend, validated on
-> Radeon RX 9070 XT (gfx1201) on Windows. See
-> [docs/amd-hip-port.md](docs/amd-hip-port.md) ([中文](docs/amd-hip-port.zh-CN.md))
+> Radeon RX 9070 XT (gfx1201) on Windows, including **interleaved-SWA models**
+> (gemma-3/gemma-4 family, QAT quants included) and an **LM Studio runtime
+> extension pack** ([docs/lmstudio-runtime-packaging.md](docs/lmstudio-runtime-packaging.md)).
+> See [docs/amd-hip-port.md](docs/amd-hip-port.md) ([中文](docs/amd-hip-port.zh-CN.md))
 > for prerequisites, build, run, benchmarks and troubleshooting. The rest of this
 > README documents the original CUDA setup.
 
@@ -110,7 +112,7 @@ scripts/apply-patches.sh
 scripts/build-cuda.sh
 ```
 
-The submodule is ggml-org/llama.cpp at pin `b81c99b`. `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` (or `multimodal-upgrade.patch` on an older KVMem tree). Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. See [patches/README.md](patches/README.md).
+The submodule is ggml-org/llama.cpp at pin `a25c986` (tag `b11189`, the release LM Studio's official ROCm runtime 2.46.0 ships). `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` (or `multimodal-upgrade.patch` on an older KVMem tree). Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. See [patches/README.md](patches/README.md).
 
 `scripts/build-cuda.sh` sets `GGML_CUDA_FA_ALL_QUANTS=ON` (needed for `--kv-dtype q5_0` on hybrid models). Binaries: `build/bin/llama-kvmem-server`.
 
@@ -496,6 +498,8 @@ Native TLS is not supported. Stream `usage` includes
 - [Modification plan](docs/modification-plan.md)
 - [Architecture](docs/architecture.md)
 - [AMD HIP/ROCm port](docs/amd-hip-port.md) ([中文](docs/amd-hip-port.zh-CN.md))
+- [AMD: LM Studio runtime extension pack](docs/lmstudio-runtime-packaging.md)
+- [AMD: KVMem vs stock performance comparison](docs/kvmem-performance-comparison.md)
 - [KVMem disk (NVMe) spill tier on Windows — plan](docs/kvmem-nvme-disk-tier-windows.md)
 - [Patch replay](patches/README.md)
 - [Recommended 16 GiB performance](docs/recommended-config-performance.md)
