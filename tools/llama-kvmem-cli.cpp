@@ -247,6 +247,12 @@ int main(int argc, char ** argv) {
     } else if (i < argc) {
         prompt = argv[i++];
         for (; i < argc; ++i) {
+            if (argv[i][0] == '-' && argv[i][1] != '\0') {
+                fprintf(stderr,
+                        "llama-kvmem-cli: warning: flag-like token \"%s\" appears after the "
+                        "positional prompt; it is folded into the prompt text, NOT parsed as "
+                        "an option (put the prompt last)\n", argv[i]);
+            }
             prompt += " ";
             prompt += argv[i];
         }
