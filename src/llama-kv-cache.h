@@ -166,8 +166,10 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+    bool seq_rm_logical(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
 
     // The stream holding seq_id's cells.
     uint32_t get_stream(llama_seq_id seq_id) const;
