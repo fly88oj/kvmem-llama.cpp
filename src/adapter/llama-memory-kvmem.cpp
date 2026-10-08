@@ -35,9 +35,90 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 static llama_kvmem_params g_kvmem_params = {};
+
+// ---------------------------------------------------------------------------
+// Environment bridge: lets stock llama.cpp binaries (e.g. an LM Studio
+// runtime build of llama-server) enable/configure KVMem without CLI flags.
+// The host process inherits the user's environment, so `setx KVMEM_ENABLE 1`
+// (plus optional KVMEM_* knobs) is enough. Values set explicitly via
+// llama_kvmem_set_params keep priority: env only fills from the current state.
+// ---------------------------------------------------------------------------
+static bool g_kvmem_env_applied = false;
+static std::string g_kvmem_env_nvme_dir;
+
+static void llama_kvmem_apply_env_once() {
+    if (g_kvmem_env_applied) {
+        return;
+    }
+    g_kvmem_env_applied = true;
+    // Tri-state KVMEM_ENABLE: unset -> build default (KVMEM_DEFAULT_ON builds,
+    // e.g. the LM Studio dedicated runtime, start enabled); "0" forces off; "1" forces on.
+    const char * enable = std::getenv("KVMEM_ENABLE");
+    bool on;
+    if (enable && *enable) {
+        on = (*enable == '1' || *enable == 't' || *enable == 'T' || *enable == 'y' || *enable == 'Y');
+    } else {
+#if defined(KVMEM_DEFAULT_ON)
+        on = true;
+#else
+        on = false;
+#endif
+    }
+    if (!on) {
+        return;
+    }
+    llama_kvmem_params p = g_kvmem_params;
+    p.enabled = true;
+    // stock binaries never set a method; the CLI default is retrieval (1)
+    if (!std::getenv("KVMEM_METHOD")) {
+        p.method = 1;
+    }
+    auto u32 = [](const char * name, uint32_t & f) {
+        if (const char * v = std::getenv(name)) { f = (uint32_t) strtoul(v, nullptr, 10); }
+    };
+    auto i32 = [](const char * name, int32_t & f) {
+        if (const char * v = std::getenv(name)) { f = (int32_t) strtol(v, nullptr, 10); }
+    };
+    auto f32 = [](const char * name, float & f) {
+        if (const char * v = std::getenv(name)) { f = strtof(v, nullptr); }
+    };
+    auto u64 = [](const char * name, uint64_t & f) {
+        if (const char * v = std::getenv(name)) { f = (uint64_t) strtoull(v, nullptr, 10); }
+    };
+    auto b   = [](const char * name, bool & f) {
+        if (const char * v = std::getenv(name)) { f = (*v == '1' || *v == 't' || *v == 'T'); }
+    };
+    u32("KVMEM_BUDGET",         p.budget);
+    u32("KVMEM_GEN_RESERVE",    p.gen_reserve);
+    u32("KVMEM_BLOCK_TOKENS",   p.block_tokens);
+    u32("KVMEM_SINK_TOKENS",    p.sink_tokens);
+    u32("KVMEM_RECENT_TOKENS",  p.recent_tokens);
+    i32("KVMEM_METHOD",         p.method);
+    i32("KVMEM_MTP_STATE",      p.mtp_state);
+    f32("KVMEM_GPU_RATIO",      p.gpu_memory_ratio);
+    f32("KVMEM_GPU_HIGH",       p.gpu_high_watermark);
+    f32("KVMEM_GPU_LOW",        p.gpu_low_watermark);
+    u64("KVMEM_CPU_BYTES",      p.cpu_bytes);
+    u64("KVMEM_NVME_BYTES",     p.nvme_bytes);
+    b  ("KVMEM_HARVEST_V",      p.harvest_v);
+    b  ("KVMEM_RAW_K_NVME",     p.raw_k_nvme);
+    if (const char * v = std::getenv("KVMEM_NVME_DIR")) {
+        g_kvmem_env_nvme_dir = v;
+        p.nvme_dir = g_kvmem_env_nvme_dir.c_str();
+    }
+    // dedicated-runtime defaults (RTX 4090 / 24 GB validated); env values above win
+    if (!std::getenv("KVMEM_BUDGET") && p.budget == 0) {
+        p.budget = 32768;
+    }
+    if (!std::getenv("KVMEM_GEN_RESERVE") && p.gen_reserve == 0) {
+        p.gen_reserve = 16384;
+    }
+    g_kvmem_params = p;
+}
 
 struct llama_memory_kvmem::GdnReplay {
     ggml_backend_buffer_ptr descriptors;
@@ -248,6 +329,7 @@ void llama_kvmem_set_params(const struct llama_kvmem_params * params) {
 }
 
 const struct llama_kvmem_params * llama_kvmem_get_params(void) {
+    llama_kvmem_apply_env_once();
     return &g_kvmem_params;
 }
 
@@ -436,6 +518,7 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         const llama_model & model,
         const llama_memory_params & params,
         const llama_cparams & cparams) {
+    llama_kvmem_apply_env_once();
     if (!g_kvmem_params.enabled) {
         return nullptr;
     }
