@@ -172,10 +172,25 @@ bool llama_batch_allocr::init(
     // set up the internal llama_batch to point to our owned arrays
     //
 
+    bool has_logical = false;
+    for (int32_t i = 0; i < n_tok; ++i) {
+        if (batch_inp.tokens[i].pos_logical >= 0) { has_logical = true; break; }
+    }
+    if (has_logical) {
+        logical_vec.resize(n_tok);
+        for (int32_t i = 0; i < n_tok; ++i) {
+            const llama_pos pl = batch_inp.tokens[i].pos_logical;
+            logical_vec[i] = pl >= 0 ? pl : batch_inp.tokens[i].pos[0];
+        }
+    } else {
+        logical_vec.clear();
+    }
+
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
     batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
     batch.pos      = pos.data();
+    batch.logical_pos = logical_vec.empty() ? nullptr : logical_vec.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
     batch.logits   = output.data();
@@ -1202,6 +1217,14 @@ void llama_batch_ext_clear(llama_batch_ext * batch) {
 
 int32_t llama_batch_ext_add(llama_batch_ext * batch, llama_seq_id seq_id) {
     return batch->add_token(seq_id);
+}
+
+bool llama_batch_ext_set_pos_logical(llama_batch_ext * batch, int32_t idx, llama_pos pos) {
+    if (idx < 0 || (uint32_t) idx >= batch->tokens.size()) {
+        return false;
+    }
+    batch->tokens[idx].pos_logical = pos;
+    return true;
 }
 
 int32_t llama_batch_ext_add_token(llama_batch_ext * batch, llama_seq_id seq_id, llama_token id) {

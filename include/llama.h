@@ -1037,6 +1037,8 @@ extern "C" {
 
     // Add an input token to the batch, with a specified token ID or token embedding
     LLAMA_API int32_t llama_batch_ext_add_token(struct llama_batch_ext * batch, llama_seq_id seq_id, llama_token id);
+    // kvmem: optional cache-row cursor override for entry idx (-1 resets to pos)
+    LLAMA_API bool llama_batch_ext_set_pos_logical(struct llama_batch_ext * batch, int32_t idx, llama_pos pos);
     LLAMA_API int32_t llama_batch_ext_add_embd (struct llama_batch_ext * batch, llama_seq_id seq_id, struct llama_embd embd);
 
     // Add the token at index idx in the batch to another sequence id. The position will stays the same.

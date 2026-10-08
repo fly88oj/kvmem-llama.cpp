@@ -1339,6 +1339,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<llama_sampler *> backend_chains;
 
     int32_t n_embd = 0;
+    std::vector<llama_pos> logical_pos;
+    std::vector<llama_pos> synced_rows;
+    std::vector<llama_pos> verify_start;
 
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
@@ -1389,6 +1392,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         batch = common_batch(ctx_dft);
 
+        synced_rows.assign(n_seq, 0);
+        verify_start.assign(n_seq, 0);
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
@@ -1417,7 +1423,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // ctx_other is also set for Qwen MTP so the KVMem factory can follow the target
+        // slot-pool. Shared-KV (Gemma4 assistants) is the same memory object.
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt
+                && llama_get_memory(ctx_dft) == llama_get_memory(ctx_tgt);
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
@@ -1461,7 +1470,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         auto * ctx_dft = this->params.ctx_dft;
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        const llama_pos pos_max = std::find(prompt.begin(), prompt.end(), LLAMA_TOKEN_NULL) != prompt.end()
+                ? synced_rows[seq_id] - 1 : llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
         if (pos_max < N - 1 && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
@@ -1477,10 +1487,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens?
-        if (!batch_in.has_token() || batch_in.has_embd()) {
-            return true;
-        }
+        if (!batch_in.has_token() && !batch_in.has_embd()) return false;
 
         const int32_t n_tokens = batch_in.size();
 
@@ -1519,7 +1526,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             for (int k = 0; k < n_tokens; ++k) {
                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
-                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+                const int32_t idx = batch.add(batch_in.tokens[k].id != LLAMA_TOKEN_NULL ? batch_in.tokens[k].id : 0, batch_in.tokens[k].pos[0], seq_id, false);
+                llama_batch_ext_set_pos_logical(batch.get(), idx, batch_in.tokens[k].pos_logical >= 0 ? batch_in.tokens[k].pos_logical : batch_in.tokens[k].pos[0]);
 
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()
@@ -1567,6 +1575,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
+            const int first = i_batch_beg[seq_id];
+            verify_start[seq_id] = batch_in.tokens[first].pos_logical >= 0 ? batch_in.tokens[first].pos_logical : batch_in.tokens[first].pos[0];
+            synced_rows[seq_id] = verify_start[seq_id] + n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
@@ -1602,6 +1613,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+            llama_batch_ext_set_pos_logical(batch.get(), idx, dp.n_past_logical >= 0 ? dp.n_past_logical : dp.pos0);
             batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
             i_last[seq_id] = idx;
@@ -1741,8 +1753,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        synced_rows[seq_id] = verify_start[seq_id] + i_h + 1;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || (llama_seq_id) seq_id >= (llama_seq_id) n_seq) return false;
+        data.resize(sizeof(llama_pos) + (size_t) n_embd*sizeof(float));
+        std::memcpy(data.data(), &synced_rows[seq_id], sizeof(llama_pos));
+        std::memcpy(data.data() + sizeof(llama_pos), pending_h[seq_id].data(), (size_t) n_embd*sizeof(float));
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || (llama_seq_id) seq_id >= (llama_seq_id) n_seq) return;
+        if (data.size() != sizeof(llama_pos) + (size_t) n_embd*sizeof(float)) {
+            throw std::runtime_error("invalid MTP carry state");
+        }
+        std::memcpy(&synced_rows[seq_id], data.data(), sizeof(llama_pos));
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd*sizeof(float));
+        verify_h_rows[seq_id] = 0;
     }
 };
 

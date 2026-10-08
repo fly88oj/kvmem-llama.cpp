@@ -102,6 +102,7 @@ struct llama_batch_ext {
         bool         output = false; // TODO: have dedicated output flags
         std::unordered_set<llama_seq_id> seq_ids;
         std::array<llama_pos, GGML_MROPE_SECTIONS> pos = {0, 0, 0, 0};
+        llama_pos pos_logical = -1; // kvmem: cache row cursor, -1 = use pos
     };
     std::vector<token> tokens;
     std::vector<float> embd;
@@ -201,6 +202,7 @@ private:
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;
+    std::vector<llama_pos>      logical_vec;  // kvmem: owned logical positions
     std::vector<int32_t>        n_seq_id;
     std::vector<llama_seq_id *> seq_id;
     std::vector<llama_seq_id>   seq_id_unq;
