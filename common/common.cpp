@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "../src/llama-batch.h"
 #if defined(LLAMA_KVMEM)
 #include "llama-kvmem-hooks.h"
 #endif
@@ -2097,6 +2098,21 @@ bool common_replay_last_token(struct llama_context * ctx, llama_token last_token
     return true;
 }
 
+void common_batch::reset(const llama_batch_ext & ext) {
+    tokens.clear();
+    n_pos = 1;
+    for (const auto & t : ext.tokens) {
+        token ct{};
+        ct.id = t.id;
+        for (int j = 0; j < (int) GGML_MROPE_SECTIONS; ++j) ct.pos[j] = t.pos[j];
+        ct.pos_logical = t.pos_logical;
+        ct.output = t.output;
+        ct.seq_id = *t.seq_ids.begin();
+        ct.embd = llama_embd{ nullptr, 0, 0 };
+        tokens.push_back(std::move(ct));
+    }
+}
+
 common_batch::common_batch(llama_context * ctx) : batch(llama_batch_ext_init(ctx)) {
     const auto rope_type = llama_model_rope_type(llama_get_model(ctx));
     n_pos = rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? GGML_MROPE_SECTIONS : 1;
@@ -2107,7 +2123,7 @@ void common_batch::clear() {
 }
 
 int32_t common_batch::add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool output) {
-    tokens.push_back({ id, { pos, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, {} });
+    tokens.push_back({ id, { pos, 0, 0, 0 }, /*pos_logical=*/ -1, seq_id, output, { nullptr, 0, 0 }, {} });
     return size() - 1;
 }
 
@@ -2146,7 +2162,7 @@ bool common_batch::set_embd(int32_t idx, llama_embd embd) {
 }
 
 int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output) {
-    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd, {} };
+    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, /*pos_logical=*/ -1, seq_id, output, embd, {} };
     for (int32_t j = 0; j < n_pos; ++j) {
         t.pos[j] = pos[j];
     }

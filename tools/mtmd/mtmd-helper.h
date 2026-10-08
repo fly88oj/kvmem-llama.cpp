@@ -144,7 +144,7 @@ MTMD_API int32_t mtmd_helper_decode_image_chunk(mtmd_context * ctx,
                                                 void * user_data);
 
 // Alternate decode dispatch; preserves native batching, positions and attention setup.
-typedef int32_t (*mtmd_helper_decode_callback)(struct llama_context * lctx, struct llama_batch batch, void * user_data);
+typedef int32_t (*mtmd_helper_decode_callback)(struct llama_context * lctx, struct llama_batch_ext * batch, void * user_data);
 MTMD_API int32_t mtmd_helper_decode_image_chunk_with_decoder(
         mtmd_context * ctx, struct llama_context * lctx, const mtmd_input_chunk * chunk,
         float * encoded_embd, llama_pos n_past, llama_seq_id seq_id, int32_t n_batch,

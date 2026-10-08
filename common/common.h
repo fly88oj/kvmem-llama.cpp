@@ -1046,6 +1046,7 @@ struct common_batch {
     struct token {
         llama_token  id;
         std::array<llama_pos, GGML_MROPE_SECTIONS> pos; // only pos[0] is used for text tokens
+        llama_pos pos_logical = -1; // kvmem: cache row cursor, -1 = use pos[0]
         llama_seq_id seq_id; // the first sequence id, see add_seq()
         bool         output;
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
@@ -1059,6 +1060,9 @@ struct common_batch {
 
     common_batch() = default;
     common_batch(struct llama_context * ctx);
+
+    // kvmem: wrap an already-built external batch (tokens are copied; the ext stays owned by the caller)
+    void reset(const struct llama_batch_ext & ext);
 
     llama_batch_ext * get() { return get_sub_batch(0, size()); }
 
