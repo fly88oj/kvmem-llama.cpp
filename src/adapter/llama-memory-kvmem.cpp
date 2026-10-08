@@ -542,6 +542,46 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
                 __func__, llm_arch_name(model.arch));
         return nullptr;
     }
+    // Internalized KV type for the bounded slot-pool: launchers that only know stock
+    // flags pass f16 caches (--cache-type-k/-v defaults). KVMEM_CACHE_TYPE overrides
+    // explicitly (f16|f32|q8_0|q5_0|q4_0); in KVMEM_DEFAULT_ON builds an f16 default
+    // is lowered to q8_0 to match the validated llama-kvmem-server recipe (half the
+    // pool VRAM, measured quality-neutral). Non-f16 caller choices are respected as-is;
+    // KVMEM_CACHE_TYPE=f16 explicitly keeps f16 (a plain f16 flag is indistinguishable
+    // from the launcher default, so it is lowered too).
+    ggml_type want_k = params.type_k;
+    ggml_type want_v = params.type_v;
+    if (const char * e = std::getenv("KVMEM_CACHE_TYPE")) {
+        ggml_type t = GGML_TYPE_COUNT;
+        if      (!strcmp(e, "f16"))  { t = GGML_TYPE_F16; }
+        else if (!strcmp(e, "f32"))  { t = GGML_TYPE_F32; }
+        else if (!strcmp(e, "q8_0")) { t = GGML_TYPE_Q8_0; }
+        else if (!strcmp(e, "q5_0")) { t = GGML_TYPE_Q5_0; }
+        else if (!strcmp(e, "q4_0")) { t = GGML_TYPE_Q4_0; }
+        if (t != GGML_TYPE_COUNT) {
+            want_k = t; want_v = t;
+        } else {
+            LLAMA_LOG_WARN("%s: ignoring unknown KVMEM_CACHE_TYPE=%s\n", __func__, e);
+        }
+    } else {
+#if defined(KVMEM_DEFAULT_ON)
+        if (want_k == GGML_TYPE_F16 && want_v == GGML_TYPE_F16) {
+            LLAMA_LOG_INFO("%s: slot-pool KV type f16 -> q8_0 (KVMEM runtime default; "
+                           "set KVMEM_CACHE_TYPE=f16 to keep f16)\n", __func__);
+            want_k = GGML_TYPE_Q8_0;
+            want_v = GGML_TYPE_Q8_0;
+        }
+#endif
+    }
+    if (want_k != params.type_k || want_v != params.type_v) {
+        llama_memory_params mp = params;
+        mp.type_k = want_k;
+        mp.type_v = want_v;
+        if (llm_arch_is_hybrid(model.arch)) {
+            return new llama_memory_kvmem_hybrid(model, mp, cparams);
+        }
+        return new llama_memory_kvmem(model, mp, cparams);
+    }
     if (cparams.n_seq_max > 1) {
         LLAMA_LOG_WARN("%s: KVMem requires n_seq_max=1 (got %u)\n",
                 __func__, cparams.n_seq_max);
