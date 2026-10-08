@@ -3,6 +3,9 @@
 
 #include "build-info.h"
 #include "common.h"
+#if defined(LLAMA_KVMEM)
+#include "llama-kvmem-hooks.h"
+#endif
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -1630,8 +1633,6 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 // KVMem memory is single-sequence; the dedicated LM Studio runtime internalizes
 // the required --parallel 1 here instead of relying on the launcher to pass it.
 // Explicitly disabling KVMem (KVMEM_ENABLE=0) restores stock multi-slot behavior.
-extern "C" const struct llama_kvmem_params * llama_kvmem_get_params(void);
-
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 

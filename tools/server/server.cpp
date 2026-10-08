@@ -6,6 +6,9 @@
 #include "server-tools.h"
 
 #include "arg.h"
+#if defined(LLAMA_KVMEM)
+#include "llama-kvmem-hooks.h"
+#endif
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
@@ -21,8 +24,6 @@
 #if defined(_WIN32)
 #include <windows.h>
 #endif
-
-extern "C" const struct llama_kvmem_params * llama_kvmem_get_params(void);
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;

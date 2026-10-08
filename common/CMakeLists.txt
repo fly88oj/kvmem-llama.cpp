@@ -135,6 +135,10 @@ set_target_properties(${TARGET} PROPERTIES
 
 target_include_directories(${TARGET} PUBLIC .)
 target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
+if (LLAMA_KVMEM)
+    target_include_directories(${TARGET} PUBLIC ${LLAMA_KVMEM_ROOT}/src/adapter)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_KVMEM=1)
+endif()
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (LLAMA_SUBPROCESS)

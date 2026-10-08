@@ -61,6 +61,10 @@ endif()
 set(TARGET llama-server)
 
 add_executable(${TARGET} main.cpp)
+if (LLAMA_KVMEM)
+    target_include_directories(${TARGET} PRIVATE ${LLAMA_KVMEM_ROOT}/src/adapter)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_KVMEM=1)
+endif()
 install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
