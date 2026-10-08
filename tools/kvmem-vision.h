@@ -40,7 +40,7 @@ public:
     ~kvmem_vision();
     std::shared_ptr<kvmem_prompt> tokenize(const std::string & prompt, const std::vector<std::vector<uint8_t>> & files);
     int decode(llama_context * ctx, const kvmem_prompt & prompt, size_t row, int n_batch,
-               const std::function<int(llama_batch)> & dispatch);
+               const std::function<int(llama_batch_ext *)> & dispatch);
     void reset_stats() { encode_calls = 0; encode_ms = 0; }
     uint32_t encode_calls = 0;
     double encode_ms = 0;

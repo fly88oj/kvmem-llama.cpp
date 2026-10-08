@@ -178,36 +178,32 @@ int kvmem_spec_decode_span(llama_context * ctx,
     if (n_batch <= 0) {
         n_batch = 512;
     }
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    common_batch batch(ctx);
     int n_pos = pos0;
     while (n_pos < pos1) {
         if (abort && abort()) {
             kvmem_diag("KVMEM_TRACE stream_abort phase=prefill pos=%d what=%s\n",
                     n_pos, what ? what : "");
-            llama_batch_free(batch);
             return KVMEM_DECODE_ABORT;
         }
         const int n = std::min(n_batch, pos1 - n_pos);
-        common_batch_clear(batch);
+        batch.clear();
         for (int i = 0; i < n; ++i) {
-            common_batch_add(batch, toks[n_pos + i], n_pos + i, { 0 }, false);
+            batch.add(toks[n_pos + i], n_pos + i, (llama_seq_id) 0, false);
         }
-        const int rc = llama_decode(ctx, batch);
+        const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (rc != 0) {
             fprintf(stderr, "llama_decode(%s) failed rc=%d at pos=%d n=%d\n",
                     what, rc, n_pos, n);
-            llama_batch_free(batch);
             return rc;
         }
         if (spec && !common_speculative_process(spec, batch)) {
             fprintf(stderr, "common_speculative_process(%s) failed at pos=%d n=%d\n",
                     what, n_pos, n);
-            llama_batch_free(batch);
             return 1;
         }
         n_pos += n;
     }
-    llama_batch_free(batch);
     return 0;
 }
 
@@ -276,10 +272,8 @@ kvmem_spec_gen_stats kvmem_spec_generate(
 
     llama_token id_last = prompt.back();
     int n_past = (int) prompt.size() - 1;
-    llama_batch batch_tgt = llama_batch_init((int) llama_n_batch(ctx_tgt), 0, 1);
+    common_batch batch_tgt(ctx_tgt);
     llama_tokens draft;
-    std::vector<llama_pos> logical_positions(llama_n_batch(ctx_tgt));
-    batch_tgt.logical_pos = logical_positions.data();
     std::vector<uint8_t> driver_ckpt;
     common_prompt_checkpoint ckpt;
     bool has_eos = false;
@@ -335,25 +329,27 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             }
         }
 
-        common_batch_clear(batch_tgt);
-        logical_positions[0] = n_past;
-        common_batch_add(batch_tgt, id_last, n_past++ + position_offset, { seq_id }, true);
+        batch_tgt.clear();
+        {
+            const int32_t idx0 = batch_tgt.add(id_last, n_past++ + position_offset, seq_id, true);
+            llama_batch_ext_set_pos_logical(batch_tgt.get(), idx0, n_past - 1);
+        }
         for (size_t i = 0; i < draft.size(); ++i) {
-            logical_positions[batch_tgt.n_tokens] = n_past + (llama_pos) i;
-            common_batch_add(batch_tgt, draft[i], n_past + position_offset + (llama_pos) i, { seq_id }, true);
+            const int32_t idx = batch_tgt.add(draft[i], n_past + position_offset + (llama_pos) i, seq_id, true);
+            llama_batch_ext_set_pos_logical(batch_tgt.get(), idx, n_past + (llama_pos) i);
         }
 
         gdn_replay_transaction transaction{ctx_tgt};
         if (sess.use_gdn_replay) {
-            transaction.active = llama_kvmem_gdn_replay_begin(batch_tgt.pos[0], batch_tgt.n_tokens);
+            transaction.active = llama_kvmem_gdn_replay_begin(batch_tgt.tokens[0].pos[0], (int32_t) batch_tgt.size());
             if (!transaction.active) {
-                fprintf(stderr, "GDN replay begin failed at pos=%d width=%d\n", batch_tgt.pos[0], batch_tgt.n_tokens);
+                fprintf(stderr, "GDN replay begin failed at pos=%d width=%d\n", (int) batch_tgt.tokens[0].pos[0], (int) batch_tgt.size());
                 st.failed = true;
                 break;
             }
         }
         const auto verify_start = ggml_time_us();
-        const int rc = llama_decode(ctx_tgt, batch_tgt);
+        const int rc = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get());
         if (rc != 0) {
             fprintf(stderr, "llama_decode(spec verify) failed rc=%d n_draft=%zu\n",
                     rc, draft.size());
@@ -416,7 +412,7 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         if (ids.empty() || (sess.use_gdn_replay && abort && abort())) {
             if (sess.use_gdn_replay) {
                 if (!transaction.commit(0)) st.failed = true;
-                n_past = logical_positions[0];
+                n_past = (int) batch_tgt.tokens.empty() ? n_past : (int) batch_tgt.tokens[0].pos_logical;
                 if (!llama_kvmem_remove_logical(ctx_tgt, n_past, -1) ||
                         (ctx_dft && !llama_kvmem_remove_logical(ctx_dft, n_past, -1))) st.failed = true;
                 llama_kvmem_truncate_cached(n_past);
@@ -494,6 +490,5 @@ kvmem_spec_gen_stats kvmem_spec_generate(
     common_speculative_print_stats(spec);
 
     st.n_past = n_past;
-    llama_batch_free(batch_tgt);
     return st;
 }

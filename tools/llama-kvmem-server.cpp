@@ -217,6 +217,7 @@ struct ServerState {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     const llama_vocab * vocab = nullptr;
+    common_batch mm_spec_batch; // reuse buffer for MTP process() during multimodal prefill
     common_chat_templates_ptr tmpls;
     llama_kvmem_params kparams {};
     int n_batch = 512;
@@ -492,29 +493,26 @@ static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, 
     // Explicit pos: T5 query sits in the middle of the prompt (last user, then
     // assistant tool XML + role=tool). llama_batch_get_one would append at
     // seq_pos_max+1 and miss the hole after seq_rm(q0,q1).
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    common_batch batch(ctx);
     int n_pos = pos0;
     while (n_pos < pos1) {
         if (!stream_heartbeat(io)) {
             kvmem_diag("KVMEM_TRACE stream_abort phase=prefill pos=%d what=%s\n",
                     n_pos, what ? what : "");
-            llama_batch_free(batch);
             return KVMEM_DECODE_ABORT;
         }
         const int n = std::min(n_batch, pos1 - n_pos);
-        common_batch_clear(batch);
+        batch.clear();
         for (int i = 0; i < n; ++i) {
-            common_batch_add(batch, toks[n_pos + i], n_pos + i, { 0 }, i == n - 1);
+            batch.add(toks[n_pos + i], n_pos + i, (llama_seq_id) 0, i == n - 1);
         }
-        const int rc = llama_decode(ctx, batch);
+        const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (rc != 0) {
             fprintf(stderr, "llama_decode(%s) failed rc=%d at pos=%d n=%d\n", what, rc, n_pos, n);
-            llama_batch_free(batch);
             return rc;
         }
         n_pos += n;
     }
-    llama_batch_free(batch);
     return 0;
 }
 

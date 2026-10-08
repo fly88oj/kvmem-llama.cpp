@@ -1,6 +1,7 @@
 #pragma once
 
 #include <set>
+#include "../llama.cpp/src/llama-batch.h"
 #include <numeric>
 
 static void multimodal_validate_capacity(const ServerState & st, const kvmem_prompt & prompt, int query, int end) {
@@ -138,21 +139,25 @@ static void multimodal_finish_request(ServerState & st) {
 
 static int multimodal_decode_span(ServerState & st, int begin, int end, bool replay, StreamIo * io) {
     const auto & prompt = *st.active_prompt;
-    auto dispatch = [&](llama_batch batch) -> int {
+    auto dispatch = [&](llama_batch_ext * batch_ext) -> int {
         if (!stream_heartbeat(io)) return KVMEM_DECODE_ABORT;
         kvmem_diag("KVMEM_TRACE multimodal_decode context=%p rows=[%d,%d) model_pos=%d image=%d replay=%d\n",
-                (void *) st.ctx, batch.logical_pos[0], batch.logical_pos[batch.n_tokens - 1] + 1,
-                batch.pos[0], batch.token == nullptr, replay);
+                (void *) st.ctx, batch_ext->tokens[0].pos_logical, batch_ext->tokens[((int32_t) batch_ext->tokens.size()) - 1].pos_logical + 1,
+                batch_ext->tokens[0].pos[0], (int) !(!batch_ext->tokens.empty() && batch_ext->tokens[0].id != LLAMA_TOKEN_NULL), replay);
         const auto start = std::chrono::steady_clock::now();
         const bool diagnostic = llama_kvmem_get_transfer_stats().enabled;
         st.mm_live_checkpoint.reset();
-        int rc = llama_decode(st.ctx, batch);
+        int rc = llama_process(st.ctx, LLAMA_PROCESS_TYPE_DECODE, batch_ext);
         if (diagnostic) {
             llama_synchronize(st.ctx);
             st.mm_perf.target_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         }
         const auto draft_start = std::chrono::steady_clock::now();
-        if (rc == 0 && st.spec.ok && !common_speculative_process(st.spec.spec, batch)) rc = -1;
+        if (rc == 0 && st.spec.ok) {
+            common_batch & cb = st.mm_spec_batch;
+            cb.reset(*batch_ext);
+            if (!common_speculative_process(st.spec.spec, cb)) rc = -1;
+        }
         if (diagnostic && st.spec.ok) {
             llama_synchronize(st.spec.ctx_dft);
             st.mm_perf.draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - draft_start).count();
@@ -161,19 +166,19 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
         const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         (replay ? st.mm_perf.replay_ms : st.mm_perf.first_ms) += elapsed;
         kvmem_diag("KVMEM_TRACE multimodal_compute rows=%d elapsed_ms=%.3f image=%d replay=%d\n",
-                batch.n_tokens, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
-                batch.token == nullptr, replay);
+                (int) ((int32_t) batch_ext->tokens.size()), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                (int) !(!batch_ext->tokens.empty() && batch_ext->tokens[0].id != LLAMA_TOKEN_NULL), replay);
         if (rc == 0) {
-            st.mm_live_row = batch.logical_pos[batch.n_tokens - 1] + 1;
-            if (replay) st.mm_replayed += batch.n_tokens;
+            st.mm_live_row = batch_ext->tokens[((int32_t) batch_ext->tokens.size()) - 1].pos_logical + 1;
+            if (replay) st.mm_replayed += (int) ((int32_t) batch_ext->tokens.size());
             else {
-                const int tail = std::clamp(st.mm_lcp - batch.logical_pos[0], 0, batch.n_tokens);
+                const int tail = std::clamp(st.mm_lcp - (int) batch_ext->tokens[0].pos_logical, 0, (int) ((int32_t) batch_ext->tokens.size()));
                 st.mm_tail_replayed += tail;
-                if (batch.token) st.mm_new_text += batch.n_tokens - tail;
-                else st.mm_new_image += batch.n_tokens - tail;
+                if ((!batch_ext->tokens.empty() && batch_ext->tokens[0].id != LLAMA_TOKEN_NULL)) st.mm_new_text += (int) ((int32_t) batch_ext->tokens.size()) - tail;
+                else st.mm_new_image += (int) ((int32_t) batch_ext->tokens.size()) - tail;
                 // Count actual first-pass work, including reconstruction after the
                 // reused checkpoint; exclude the later retrieval query replay.
-                st.log.prefilled(batch.n_tokens, (int) prompt.tokens.size() - batch.logical_pos[0]);
+                st.log.prefilled((int) ((int32_t) batch_ext->tokens.size()), (int) prompt.tokens.size() - (int) batch_ext->tokens[0].pos_logical);
             }
         }
         return rc;
@@ -197,24 +202,19 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
         const int limit = std::min(end, row + st.n_batch);
         int next = row;
         while (next < limit && prompt.tokens[next] != LLAMA_TOKEN_NULL) ++next;
-        std::vector<llama_pos> pos(next - row), logical(next - row);
         const auto pos0 = prompt.model_pos(row);
+        const bool want_output = !st.spec.ok;
+        static llama_batch_ext mm_ext(st.ctx);
+        mm_ext.clear();
         for (int i = row; i < next; ++i) {
-            pos[i - row] = pos0 + i - row;
-            logical[i - row] = i;
+            const int32_t idx = mm_ext.add_token((llama_seq_id) 0);
+            mm_ext.set_token_id(idx, prompt.tokens[i] != LLAMA_TOKEN_NULL ? prompt.tokens[i] : (llama_token) 0);
+            const llama_pos p = pos0 + i - row;
+            mm_ext.set_token_pos(idx, &p);
+            llama_batch_ext_set_pos_logical(&mm_ext, idx, i);
+            mm_ext.set_output(idx, (i == next - 1) && want_output);
         }
-        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(prompt.tokens.data()) + row, next - row);
-        batch.pos = pos.data();
-        batch.logical_pos = logical.data();
-        std::vector<int32_t> n_seq(next - row, 1);
-        llama_seq_id seq = 0;
-        std::vector<llama_seq_id *> seq_ids(next - row, &seq);
-        std::vector<int8_t> outputs(next - row, 0);
-        outputs.back() = !st.spec.ok;
-        batch.n_seq_id = n_seq.data();
-        batch.seq_id = seq_ids.data();
-        batch.logits = outputs.data();
-        const int rc = dispatch(batch);
+        const int rc = dispatch(&mm_ext);
         if (rc != 0) return rc;
         row = next;
     }

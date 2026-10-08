@@ -1,4 +1,5 @@
 #include "llama-kvmem-diag.h"
+#include "../llama.cpp/src/llama-batch.h"
 #include "kvmem-vision.h"
 #include "server-common.h"
 
@@ -107,7 +108,7 @@ std::shared_ptr<kvmem_prompt> kvmem_vision::tokenize(const std::string & prompt,
 }
 
 int kvmem_vision::decode(llama_context * ctx, const kvmem_prompt & prompt, size_t row, int n_batch,
-                       const std::function<int(llama_batch)> & dispatch) {
+                       const std::function<int(llama_batch_ext *)> & dispatch) {
     const auto * chunk = prompt.chunk(row);
     const std::string id = mtmd_input_chunk_get_id(chunk);
     auto it = cache_.find(id);
@@ -136,15 +137,16 @@ int kvmem_vision::decode(llama_context * ctx, const kvmem_prompt & prompt, size_
     it->second.used = ++clock_;
     struct callback_data {
         size_t row;
-        const std::function<int(llama_batch)> * dispatch;
+        const std::function<int(llama_batch_ext *)> * dispatch;
     } data {row, &dispatch};
-    auto decode = [](llama_context *, llama_batch batch, void * opaque) -> int32_t {
+    auto decode = [](llama_context * lctx, llama_batch_ext * batch, void * opaque) -> int32_t {
         auto & data = *static_cast<callback_data *>(opaque);
-        std::vector<llama_pos> logical(batch.n_tokens);
-        for (int i = 0; i < batch.n_tokens; ++i) logical[i] = data.row + i;
-        batch.logical_pos = logical.data();
+        const int32_t n = (int32_t) batch->tokens.size();
+        for (int32_t i = 0; i < n; ++i) {
+            llama_batch_ext_set_pos_logical(batch, i, data.row + i);
+        }
         const int rc = (*data.dispatch)(batch);
-        if (rc == 0) data.row += batch.n_tokens;
+        if (rc == 0) data.row += n;
         return rc;
     };
     llama_pos next = prompt.model_pos(row);
