@@ -1,3 +1,4 @@
 [submodule "llama.cpp"]
 	path = llama.cpp
-	url = https://github.com/ggml-org/llama.cpp.git
+	url = https://github.com/fly88oj/kvmem-llama.cpp.git
+	branch = llama/custom-b81c99b47
