@@ -1638,8 +1638,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     int32_t n_parallel = params.n_parallel;
     if (n_parallel > 1 && llama_kvmem_get_params()->enabled) {
         fprintf(stderr, "%s: KVMem requires a single sequence; clamping --parallel %d -> 1 "
-                        "(set KVMEM_ENABLE=0 to keep multi-slot behavior)
-", __func__, n_parallel);
+                        "(set KVMEM_ENABLE=0 to keep multi-slot behavior)\n", __func__, n_parallel);
         n_parallel = 1;
     }
 

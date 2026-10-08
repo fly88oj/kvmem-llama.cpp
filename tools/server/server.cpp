@@ -22,6 +22,8 @@
 #include <windows.h>
 #endif
 
+extern "C" const struct llama_kvmem_params * llama_kvmem_get_params(void);
+
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
@@ -169,13 +171,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // the memory silently fall back to the unbounded stock cache. KVMEM_ENABLE=0
         // keeps stock multi-slot behavior.
         {
-            extern "C" const struct llama_kvmem_params * llama_kvmem_get_params(void);
             if (params.n_parallel > 1 && llama_kvmem_get_params()->enabled) {
-                SRV_WRN("KVMem requires a single sequence: clamping --parallel %d -> 1 "
-                        "(set KVMEM_ENABLE=0 to keep multi-slot behavior)
-", params.n_parallel);
-                params.n_parallel = 1;
-            }
+            SRV_WRN("KVMem requires a single sequence: clamping --parallel %d -> 1 "
+                    "(set KVMEM_ENABLE=0 to keep multi-slot behavior)\n", params.n_parallel);
+            params.n_parallel = 1;
+        }
         }
     }
 
