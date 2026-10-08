@@ -163,6 +163,20 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_parallel = 4;
             params.kv_unified = true;
         }
+
+        // KVMem runtime internalization: the bounded-window memory is single-sequence.
+        // Clamp any --parallel > 1 (LM Studio passes 4 by default) instead of letting
+        // the memory silently fall back to the unbounded stock cache. KVMEM_ENABLE=0
+        // keeps stock multi-slot behavior.
+        {
+            extern "C" const struct llama_kvmem_params * llama_kvmem_get_params(void);
+            if (params.n_parallel > 1 && llama_kvmem_get_params()->enabled) {
+                SRV_WRN("KVMem requires a single sequence: clamping --parallel %d -> 1 "
+                        "(set KVMEM_ENABLE=0 to keep multi-slot behavior)
+", params.n_parallel);
+                params.n_parallel = 1;
+            }
+        }
     }
 
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c

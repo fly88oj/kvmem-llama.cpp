@@ -1627,11 +1627,24 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+// KVMem memory is single-sequence; the dedicated LM Studio runtime internalizes
+// the required --parallel 1 here instead of relying on the launcher to pass it.
+// Explicitly disabling KVMem (KVMEM_ENABLE=0) restores stock multi-slot behavior.
+extern "C" const struct llama_kvmem_params * llama_kvmem_get_params(void);
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
+    int32_t n_parallel = params.n_parallel;
+    if (n_parallel > 1 && llama_kvmem_get_params()->enabled) {
+        fprintf(stderr, "%s: KVMem requires a single sequence; clamping --parallel %d -> 1 "
+                        "(set KVMEM_ENABLE=0 to keep multi-slot behavior)
+", __func__, n_parallel);
+        n_parallel = 1;
+    }
+
     cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel;
+    cparams.n_seq_max         = n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
