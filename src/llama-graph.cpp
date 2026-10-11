@@ -1510,6 +1510,14 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     }
 }
 
+// Read the KVMEM_DUMP_CAPTURE env flag once. Calling getenv() per layer per
+// build_graph (~3x n_layer times per ubatch) is wasteful and is not guaranteed
+// thread-safe alongside a concurrent setenv().
+static bool kvmem_dump_capture() {
+    static const bool dump = getenv("KVMEM_DUMP_CAPTURE") != nullptr;
+    return dump;
+}
+
 static void kvmem_capture_impl(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * src, int il, const char * tag) {
 #if defined(LLAMA_KVMEM)
     const llama_kvmem_params * kp = llama_kvmem_get_params();
@@ -1518,7 +1526,7 @@ static void kvmem_capture_impl(ggml_context * ctx0, ggml_cgraph * gf, ggml_tenso
     }
     // Recency/identity does not need host raw-K. Skip pinning intermediates
     // unless retrieval is on, harvest-V is on (V only), or an explicit dump.
-    if (kp->method != 1 && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
+    if (kp->method != 1 && !kvmem_dump_capture()) {
         if (!kp->harvest_v || tag[0] != 'v') {
             return;
         }

@@ -1342,6 +1342,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<llama_pos> logical_pos;
     std::vector<llama_pos> synced_rows;
     std::vector<llama_pos> verify_start;
+    bool mtp_embd_warned = false;
 
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
@@ -1487,7 +1488,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        if (!batch_in.has_token() && !batch_in.has_embd()) return false;
+        // has_token()/has_embd() only inspect tokens[0]; scan every entry
+        // instead, because a mixed batch reaching the catch-up below would hit
+        // common_batch::add with LLAMA_TOKEN_NULL and GGML_ABORT
+        bool no_token = false, any_embd = false;
+        for (const auto & t : batch_in.tokens) {
+            no_token |= t.id == LLAMA_TOKEN_NULL;
+            any_embd |= t.embd.data != nullptr;
+        }
+
+        if (no_token || any_embd) {
+            // the MTP catch-up feeds the draft target hidden rows indexed by batch
+            // position; embedding entries carry media embeddings instead, so upstream
+            // skips them. Say it once: without this the drafts just get poorer after a
+            // vision span and nothing looks wrong.
+            if (!mtp_embd_warned) {
+                SPC_WRN("MTP catch-up skipped for a batch with embedding entries "
+                        "(%s tokens); drafts after multimodal input will be poor\n",
+                        no_token ? "no" : "mixed");
+                mtp_embd_warned = true;
+            }
+            return true;
+        }
 
         const int32_t n_tokens = batch_in.size();
 

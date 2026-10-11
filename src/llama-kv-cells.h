@@ -395,6 +395,16 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // number of cells that currently carry sequence seq_id
+    // note: a position may appear in more than one cell (cache reuse via rm+add,
+    // some vision embeddings), so this counts cells, not distinct positions
+    uint32_t seq_pos_count(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return (uint32_t) seq_pos[seq_id].size();
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());

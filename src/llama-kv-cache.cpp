@@ -1663,12 +1663,20 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
             // The copy-and-patch shortcut only records cells near seq_pos_min.
             // KVMem resurrects mid-document holes far below that window; they
-            // would keep a stale mask (or never be patched). Skip the shortcut
-            // when [pos_min, pos_max] is not fully populated.
+            // would keep a stale mask (or never be patched), so skip the
+            // shortcut unless [sp_min, sp_max] is exactly, singly populated by
+            // *this* sequence.
+            // note: count cells carrying seq_id, not the whole stream -- the old
+            // get_used() also counted other sequences' cells and hid real holes.
+            // Any mismatch between the cell count and the position span (missing
+            // positions = holes, or repeated positions = duplicates) disables the
+            // shortcut conservatively; computing the full mask is always correct.
+            // The span is int64 to avoid signed overflow when sp_max is near
+            // INT32_MAX.
             const llama_pos sp_min = cells.seq_pos_min(seq_id);
             const llama_pos sp_max = cells.seq_pos_max(seq_id);
-            const bool holes = sp_min >= 0 && sp_max >= sp_min &&
-                cells.get_used() < (uint32_t) (sp_max - sp_min + 1);
+            const int64_t   sp_span = (sp_min >= 0 && sp_max >= sp_min) ? ((int64_t) sp_max - sp_min + 1) : 0;
+            const bool holes = sp_span > 0 && (int64_t) cells.seq_pos_count(seq_id) != sp_span;
 
             if (!alibi && !holes) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
