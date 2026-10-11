@@ -542,6 +542,20 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
                 __func__, llm_arch_name(model.arch));
         return nullptr;
     }
+    // Architecture whitelist: the slot-pool layout assumes Qwen3.8-family
+    // attention (GQA with per-layer KV norms, 16 attn layers in 65 blocks).
+    // Other arches can crash in kvmem_first_attn_layer/kvmem_n_attn_layers.
+    {
+        const bool arch_ok = model.arch == LLM_ARCH_QWEN35
+                          || model.arch == LLM_ARCH_QWEN35MOE
+                          || model.arch == LLM_ARCH_QWEN3;
+        if (!arch_ok) {
+            LLAMA_LOG_WARN("%s: KVMem skips untested arch %s (whitelist: qwen35/qwen35moe/qwen3); "
+                           "falling back to stock memory\n",
+                    __func__, llm_arch_name(model.arch));
+            return nullptr;
+        }
+    }
     // Internalized KV type for the bounded slot-pool: launchers that only know stock
     // flags pass f16 caches (--cache-type-k/-v defaults). KVMEM_CACHE_TYPE overrides
     // explicitly (f16|f32|q8_0|q5_0|q4_0); in KVMEM_DEFAULT_ON builds an f16 default
