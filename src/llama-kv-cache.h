@@ -171,6 +171,11 @@ public:
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
     bool seq_rm_logical(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
 
+    // KVMem: batched variant of the above for many disjoint [begin, end)
+    // ranges (block-aligned, unordered). One pass over the cells instead of
+    // one full scan per range; membership is tested against a span bitset.
+    bool seq_rm_logical_ranges(const llama_pos * begins, const llama_pos * ends, size_t n_ranges);
+
     // The stream holding seq_id's cells.
     uint32_t get_stream(llama_seq_id seq_id) const;
 

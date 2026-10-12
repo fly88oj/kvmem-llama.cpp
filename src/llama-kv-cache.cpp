@@ -404,6 +404,68 @@ bool llama_kv_cache::seq_rm_logical(llama_seq_id seq_id, llama_pos p0, llama_pos
     return true;
 }
 
+bool llama_kv_cache::seq_rm_logical_ranges(const llama_pos * begins, const llama_pos * ends, size_t n_ranges) {
+    if (n_ranges == 0 || !begins || !ends) {
+        return true;
+    }
+    llama_pos lo = std::numeric_limits<llama_pos>::max();
+    llama_pos hi = std::numeric_limits<llama_pos>::min();
+    for (size_t r = 0; r < n_ranges; ++r) {
+        const llama_pos b = std::max<llama_pos>(begins[r], 0);
+        const llama_pos e = ends[r] < 0 ? std::numeric_limits<llama_pos>::max() : ends[r];
+        if (e <= b) {
+            continue;
+        }
+        lo = std::min(lo, b);
+        hi = std::max(hi, e == std::numeric_limits<llama_pos>::max() ? std::numeric_limits<llama_pos>::max() : e - 1);
+    }
+    if (lo > hi) {
+        return true;
+    }
+    // Membership bitset over the covered span; ranges are 32-token blocks in
+    // practice, so the span is bounded by the number of moved tokens.
+    std::vector<uint64_t> mask;
+    const uint64_t span = (uint64_t) hi - (uint64_t) lo + 1;
+    const bool unbounded = hi == std::numeric_limits<llama_pos>::max();
+    if (!unbounded) {
+        mask.assign((span + 63) / 64, 0);
+        for (size_t r = 0; r < n_ranges; ++r) {
+            const llama_pos b = std::max<llama_pos>(begins[r], 0);
+            const llama_pos e = ends[r] < 0 ? hi + 1 : ends[r];
+            for (llama_pos p = b; p < e; ++p) {
+                const uint64_t u = (uint64_t) p - (uint64_t) lo;
+                mask[u >> 6] |= (uint64_t) 1 << (u & 63);
+            }
+        }
+    }
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        auto & cells = v_cells[s];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i)) {
+                continue;
+            }
+            const auto logical = cells.ext_get(i).logical_pos;
+            const auto p = logical >= 0 ? logical : cells.pos_get(i);
+            bool hit;
+            if (unbounded) {
+                hit = p >= lo;
+            } else if (p < lo || p > hi) {
+                hit = false;
+            } else {
+                const uint64_t u = (uint64_t) p - (uint64_t) lo;
+                hit = (mask[u >> 6] >> (u & 63)) & 1;
+            }
+            // KVMem only ever removes for sequence 0 (single-slot server).
+            if (!hit || !cells.seq_has(i, 0)) {
+                continue;
+            }
+            cells.seq_rm(i, 0);
+            v_heads[s] = std::min(v_heads[s], i);
+        }
+    }
+    return true;
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
