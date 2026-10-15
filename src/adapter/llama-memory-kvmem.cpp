@@ -2423,9 +2423,9 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         }
         {
             const int64_t t0 = ggml_time_us();
-            // One batched cell pass for every moved block (the per-block form
-            // scanned the whole pool twice per item: once direct, once more
-            // through the MTP wrapper, whose kv_ is this same cache).
+            // One batched cell pass per cache: the target pool here, and the
+            // MTP draft's own cache below (the per-block form scanned each
+            // pool once per item).
             std::vector<llama_pos> rb, re;
             rb.reserve(items.size());
             re.reserve(items.size());
@@ -2435,7 +2435,7 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
             }
             kv_->seq_rm_logical_ranges(rb.data(), re.data(), rb.size());
             if (mtp_) {
-                mtp_->note_layout_removed();
+                mtp_->remove_logical_ranges(rb.data(), re.data(), rb.size());
             }
             for (const auto & it : items) {
                 store.set_block_gpu_slot(it.id, -1);
@@ -2504,7 +2504,7 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         }
         kv_->seq_rm_logical_ranges(rb.data(), re.data(), rb.size());
         if (mtp_) {
-            mtp_->note_layout_removed();
+            mtp_->remove_logical_ranges(rb.data(), re.data(), rb.size());
         }
         for (const auto & it : items) {
             store.set_block_gpu_slot(it.id, -1);
@@ -4248,6 +4248,10 @@ void llama_memory_kvmem::decode_mean_add_range(uint32_t tok0, uint32_t n_add) {
                 }
             }
             decode_mean_stats_.n_gpu += n_add * n_gpu_layers;
+            // The fused pass itself produced data: without this, a fused call
+            // with no fallback nodes left any==false and the tail early-return
+            // skipped decode_mean_n_/n_tok accounting for the whole range.
+            any = n_gpu_layers > 0;
             for (const CaptureNode * n : fallback) {
                 any = decode_mean_add_host_layer(n->t, n->il, tok0, n_add) || any;
             }
@@ -4581,6 +4585,7 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
             break;
         }
         if (off + kspan > bytes) {
+            cudaStreamSynchronize(cudaStreamPerThread); // drain in-flight enqueues
             return;
         }
         if (ksrc && nget > 0 &&
@@ -4591,6 +4596,7 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
         }
         off += kspan;
         if (off + vspan > bytes) {
+            cudaStreamSynchronize(cudaStreamPerThread); // drain in-flight enqueues
             return;
         }
         if (vsrc && nget > 0 &&
@@ -4685,6 +4691,7 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
             break;
         }
         if (off + kspan > bytes) {
+            cudaStreamSynchronize(cudaStreamPerThread); // drain in-flight enqueues
             return;
         }
         if (kdst && nset > 0 &&
@@ -4697,6 +4704,7 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
         }
         off += kspan;
         if (off + vspan > bytes) {
+            cudaStreamSynchronize(cudaStreamPerThread); // drain in-flight enqueues
             return;
         }
         if (vdst && nset > 0 &&

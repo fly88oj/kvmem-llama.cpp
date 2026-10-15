@@ -94,10 +94,12 @@ public:
         if (target_) target_->note_attention_change();
         return kv_->seq_rm_logical(0, p0, p1);
     }
-    // After a batched seq_rm_logical_ranges on the shared target cache: this
-    // wrapper's kv_ IS that cache, so only the epoch bump remains to do.
-    void note_layout_removed() {
+    // Batched form of remove_logical for the retrieval-event layout: the
+    // draft's own cache (a separate llama_kv_cache) gets the same range set
+    // in one pass, plus the target epoch bump.
+    void remove_logical_ranges(const llama_pos * begins, const llama_pos * ends, size_t n) {
         if (target_) target_->note_attention_change();
+        (void) kv_->seq_rm_logical_ranges(begins, ends, n);
     }
     // raw_ is null between the two halves of a store swap, and stays null for
     // a conversation whose mirror could not be allocated (attach_conv logs and
