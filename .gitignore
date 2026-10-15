@@ -41,3 +41,6 @@ CLAUDE.md
 /build-backends/
 /lmstudio-runtime*/
 /.sync-tmp/
+
+# legacy pre-0.18.0 submodule checkout kept locally for porting reference
+/llama.cpp/
