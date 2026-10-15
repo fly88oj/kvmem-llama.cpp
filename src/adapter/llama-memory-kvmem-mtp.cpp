@@ -541,9 +541,6 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
                                  cudaMemcpyDeviceToDevice) == cudaSuccess;
         }
     }
-    if (ok && cudaDeviceSynchronize() != cudaSuccess) {
-        ok = false;
-    }
     const int ns = (int) ssrc.size();
     if (ok && ns > 0 && !kvmem_d2d_batched(ssrc.data(), sdst.data(), sbytes.data(), ns)) {
         for (int j = 0; j < ns && ok; ++j) {
@@ -551,6 +548,8 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
                                  cudaMemcpyDeviceToDevice) == cudaSuccess;
         }
     }
+    // Gather and scatter share one stream, so a sync between them was never
+    // needed; a single device sync at the end covers both.
     if (ok && cudaDeviceSynchronize() != cudaSuccess) {
         ok = false;
     }

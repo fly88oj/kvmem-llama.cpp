@@ -441,8 +441,18 @@ static void kvmem_stagein_flush_sync(int64_t * copy_us, int64_t * rope_us,
 }
 
 static bool kvmem_harvest_sync_old() {
-    const char * e = getenv("KVMEM_HARVEST_SYNC");
-    return e && e[0] != '\0' && e[0] != '0';
+    // Called per harvest ubatch; Windows CRT getenv takes the environment lock.
+    static const bool v = [] {
+        const char * e = getenv("KVMEM_HARVEST_SYNC");
+        return e && e[0] != '\0' && e[0] != '0';
+    }();
+    return v;
+}
+
+// Queried from graph build paths per layer; cache the env lookup once.
+static bool kvmem_dump_capture_env() {
+    static const bool v = getenv("KVMEM_DUMP_CAPTURE") != nullptr;
+    return v;
 }
 
 static cudaEvent_t kvmem_ggml_cuda_event(ggml_backend_event_t ev) {
@@ -1098,6 +1108,11 @@ llama_memory_kvmem::~llama_memory_kvmem() {
     d2h_free();
     multi_d2h_free();
     if (!multi_gpu_) kvmem_stagein_gpu_free();
+    if (stageout_pin_ptr_) {
+        cudaFreeHost(stageout_pin_ptr_);
+        stageout_pin_ptr_ = nullptr;
+        stageout_pin_bytes_ = 0;
+    }
     if (mtp_) {
         mtp_->detach_target();
         mtp_ = nullptr;
@@ -1932,15 +1947,21 @@ void llama_memory_kvmem::apply_plan_to_kv(const kvmem::NativeResidencyPlan & pla
     }
     {
         const int64_t t0 = ggml_time_us();
-        for (uint32_t id : plan.stage_out) {
-            if (id >= store.block_count()) {
-                continue;
+        {
+            // One batched pass over the cells for every moved block's range
+            // instead of one full scan per block (seq_rm_logical_ranges).
+            std::vector<llama_pos> rb, re;
+            for (uint32_t id : plan.stage_out) {
+                if (id >= store.block_count()) {
+                    continue;
+                }
+                const kvmem::KvMemBlock & b = store.blocks()[id];
+                if (b.n_tokens > 0) {
+                    rb.push_back(static_cast<llama_pos>(b.orig_pos_start));
+                    re.push_back(static_cast<llama_pos>(b.orig_pos_end()));
+                }
             }
-            const kvmem::KvMemBlock & b = store.blocks()[id];
-            if (b.n_tokens > 0) {
-                kv_->seq_rm_logical(0, static_cast<llama_pos>(b.orig_pos_start),
-                            static_cast<llama_pos>(b.orig_pos_end()));
-            }
+            kv_->seq_rm_logical_ranges(rb.data(), re.data(), rb.size());
         }
         if (retr_.enabled) {
             retr_.seq_rm_us += ggml_time_us() - t0;
@@ -2264,13 +2285,21 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         }
         {
             const int64_t t0 = ggml_time_us();
+            // One batched cell pass for every moved block (the per-block form
+            // scanned the whole pool twice per item: once direct, once more
+            // through the MTP wrapper, whose kv_ is this same cache).
+            std::vector<llama_pos> rb, re;
+            rb.reserve(items.size());
+            re.reserve(items.size());
             for (const auto & it : items) {
-                kv_->seq_rm_logical(0, static_cast<llama_pos>(it.orig),
-                            static_cast<llama_pos>(it.orig + it.n));
-                if (mtp_) {
-                    mtp_->remove_logical(static_cast<llama_pos>(it.orig),
-                                 static_cast<llama_pos>(it.orig + it.n));
-                }
+                rb.push_back(static_cast<llama_pos>(it.orig));
+                re.push_back(static_cast<llama_pos>(it.orig + it.n));
+            }
+            kv_->seq_rm_logical_ranges(rb.data(), re.data(), rb.size());
+            if (mtp_) {
+                mtp_->note_layout_removed();
+            }
+            for (const auto & it : items) {
                 store.set_block_gpu_slot(it.id, -1);
             }
             if (retr_.enabled) {
@@ -2328,13 +2357,18 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
 
     {
         const int64_t t0 = ggml_time_us();
+        std::vector<llama_pos> rb, re;
+        rb.reserve(items.size());
+        re.reserve(items.size());
         for (const auto & it : items) {
-            kv_->seq_rm_logical(0, static_cast<llama_pos>(it.orig),
-                        static_cast<llama_pos>(it.orig + it.n));
-            if (mtp_) {
-                mtp_->remove_logical(static_cast<llama_pos>(it.orig),
-                             static_cast<llama_pos>(it.orig + it.n));
-            }
+            rb.push_back(static_cast<llama_pos>(it.orig));
+            re.push_back(static_cast<llama_pos>(it.orig + it.n));
+        }
+        kv_->seq_rm_logical_ranges(rb.data(), re.data(), rb.size());
+        if (mtp_) {
+            mtp_->note_layout_removed();
+        }
+        for (const auto & it : items) {
             store.set_block_gpu_slot(it.id, -1);
         }
         if (retr_.enabled) {
@@ -4024,29 +4058,88 @@ void llama_memory_kvmem::decode_mean_add_range(uint32_t tok0, uint32_t n_add) {
     }
     const bool gpu_ready = !multi_gpu_ && kvmem_meank_ready(n_layer_, n_embd_k_);
     bool any = false;
-    for (const CaptureNode & n : decode_mean_pending_k_) {
-        if (!n.t || static_cast<uint32_t>(n.il) >= n_layer_) {
-            continue;
-        }
-        bool ok = false;
-        if (gpu_ready) {
+    // Fused fast path: one kernel launch for every pending layer with a GPU
+    // pointer, instead of one micro-kernel per layer (~2 x n_layer launches
+    // per decode step with MTP). Only nodes without a GPU pointer, or a
+    // geometry mismatch, fall back to the per-layer calls.
+    bool fused = false;
+    if (gpu_ready) {
+        decode_mean_ktab_.assign(n_layer_, nullptr);
+        ggml_type fty = GGML_TYPE_COUNT;
+        int64_t fne0 = 0;
+        size_t fnb0 = 0, fnb1 = 0, fnb2 = 0;
+        bool geo_set = false, uniform = true;
+        std::vector<const CaptureNode *> fallback;
+        for (const CaptureNode & n : decode_mean_pending_k_) {
+            if (!n.t || static_cast<uint32_t>(n.il) >= n_layer_) {
+                continue;
+            }
             const uint8_t * gpu = kvmem_cuda_tensor_ptr(n.t);
-            if (gpu &&
-                kvmem_meank_add(static_cast<uint32_t>(n.il), n.t->type, gpu,
-                                tok0, n_add, n_embd_k_, n.t->ne[0],
-                                n.t->nb[0], n.t->nb[1], n.t->nb[2])) {
-                if (decode_mean_src_.size() != n_layer_) {
-                    decode_mean_src_.assign(n_layer_, 0);
-                }
-                decode_mean_src_[static_cast<uint32_t>(n.il)] = 1;
-                decode_mean_stats_.n_gpu += n_add;
-                ok = true;
+            if (!gpu) {
+                fallback.push_back(&n);
+                continue;
+            }
+            decode_mean_ktab_[static_cast<uint32_t>(n.il)] = gpu;
+            if (!geo_set) {
+                fty = n.t->type;
+                fne0 = n.t->ne[0];
+                fnb0 = n.t->nb[0];
+                fnb1 = n.t->nb[1];
+                fnb2 = n.t->nb[2];
+                geo_set = true;
+            } else if (n.t->type != fty || n.t->ne[0] != fne0 ||
+                       n.t->nb[0] != fnb0 || n.t->nb[1] != fnb1 || n.t->nb[2] != fnb2) {
+                uniform = false;
+                break;
             }
         }
-        if (!ok) {
-            ok = decode_mean_add_host_layer(n.t, n.il, tok0, n_add);
+        if (geo_set && uniform &&
+            kvmem_meank_add_multi(decode_mean_ktab_.data(), n_layer_, fty, tok0, n_add,
+                                  n_embd_k_, fne0, fnb0, fnb1, fnb2)) {
+            fused = true;
+            if (decode_mean_src_.size() != n_layer_) {
+                decode_mean_src_.assign(n_layer_, 0);
+            }
+            uint32_t n_gpu_layers = 0;
+            for (const uint8_t * p : decode_mean_ktab_) {
+                n_gpu_layers += p != nullptr;
+            }
+            for (uint32_t il = 0; il < n_layer_; ++il) {
+                if (decode_mean_ktab_[il]) {
+                    decode_mean_src_[il] = 1;
+                }
+            }
+            decode_mean_stats_.n_gpu += n_add * n_gpu_layers;
+            for (const CaptureNode * n : fallback) {
+                any = decode_mean_add_host_layer(n->t, n->il, tok0, n_add) || any;
+            }
         }
-        any = any || ok;
+    }
+    if (!fused) {
+        for (const CaptureNode & n : decode_mean_pending_k_) {
+            if (!n.t || static_cast<uint32_t>(n.il) >= n_layer_) {
+                continue;
+            }
+            bool ok = false;
+            if (gpu_ready) {
+                const uint8_t * gpu = kvmem_cuda_tensor_ptr(n.t);
+                if (gpu &&
+                    kvmem_meank_add(static_cast<uint32_t>(n.il), n.t->type, gpu,
+                                    tok0, n_add, n_embd_k_, n.t->ne[0],
+                                    n.t->nb[0], n.t->nb[1], n.t->nb[2])) {
+                    if (decode_mean_src_.size() != n_layer_) {
+                        decode_mean_src_.assign(n_layer_, 0);
+                    }
+                    decode_mean_src_[static_cast<uint32_t>(n.il)] = 1;
+                    decode_mean_stats_.n_gpu += n_add;
+                    ok = true;
+                }
+            }
+            if (!ok) {
+                ok = decode_mean_add_host_layer(n.t, n.il, tok0, n_add);
+            }
+            any = any || ok;
+        }
     }
     if (!any) {
         decode_mean_stats_.n_miss++;
@@ -4206,30 +4299,64 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
     const uint32_t nt = blk.n_tokens;
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
-    std::vector<uint8_t> kpack(static_cast<size_t>(nt) * krow);
-    std::vector<uint8_t> vpack(static_cast<size_t>(nt) * vrow);
     const uint32_t cell0 = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_;
     if (!multi_gpu_) {
         kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
                                 std::max(krow, vrow) * (size_t) block_tokens_);
     }
     int64_t * sacc = retr_.enabled ? &retr_.set_us : nullptr;
-    auto write_packed = [&](ggml_tensor * t, uint8_t * base, const uint8_t * host,
-                            size_t row, size_t nbytes) {
-        if (!t || !host || nbytes == 0 || cell0 >= kv_size_) {
+    uint32_t il_cur = 0;
+    // Direct-to-slab: reserve the pinned slot first and let the raw store
+    // copy straight into it, instead of staging each layer through a heap
+    // vector (one extra full-block host memcpy per layer otherwise). The
+    // heap buffers serve the fallback (and multi-GPU) path only.
+    std::vector<uint8_t> kpack, vpack;
+    auto write_layer = [&](ggml_tensor * t, uint8_t * base, bool is_k) {
+        if (!t || nt == 0 || cell0 >= kv_size_) {
+            return;
+        }
+        const size_t row = is_k ? krow : vrow;
+        const size_t nbytes = row * (size_t) nt;
+        uint8_t * dst = base ? base + static_cast<size_t>(cell0) * row : nullptr;
+        if (dst && !multi_gpu_) {
+            uint8_t * slot = nullptr;
+            if (kvmem_stagein_reserve_v(dst, nbytes, &slot, sacc)) {
+                // The item is enqueued the moment the slot is reserved, so a
+                // failed source copy cannot fall through to the double-copy
+                // path below; upload zeros instead (only reachable if the raw
+                // store dropped this layer between the has_ probe and here).
+                if (!(is_k ? raw_->copy_k_gpu(block_id, il_cur, slot, nt)
+                           : raw_->copy_v_gpu(block_id, il_cur, slot, nt))) {
+                    if (native_transfer_pending_) {
+                        throw std::runtime_error("KVMem packed K/V read failed");
+                    }
+                    memset(slot, 0, nbytes);
+                }
+                return;
+            }
+        }
+        std::vector<uint8_t> & pack = is_k ? kpack : vpack;
+        pack.resize(nbytes);
+        const int64_t t_copy = ggml_time_us();
+        const bool have = is_k ? raw_->copy_k_gpu(block_id, il_cur, pack.data(), nt)
+                               : raw_->copy_v_gpu(block_id, il_cur, pack.data(), nt);
+        if (native_transfer_pending_ && !have) {
+            throw std::runtime_error("KVMem packed K/V read failed");
+        }
+        if (retr_.enabled) {
+            retr_.copy_us += ggml_time_us() - t_copy;
+        }
+        if (!have) {
             return;
         }
         if (multi_gpu_) {
-            kvmem_tensor_set(t, host, static_cast<size_t>(cell0) * row, nbytes);
-            return;
-        }
-        uint8_t * dst = base ? base + static_cast<size_t>(cell0) * row : nullptr;
-        if (dst && kvmem_stagein_enqueue_v(host, nbytes, dst, sacc)) {
+            kvmem_tensor_set(t, pack.data(), static_cast<size_t>(cell0) * row, nbytes);
             return;
         }
         const int64_t t_set = ggml_time_us();
-        if (!(dst && kvmem_stagein_h2d_bytes(dst, host, nbytes))) {
-            kvmem_tensor_set(t, host, static_cast<size_t>(cell0) * row, nbytes);
+        if (!(dst && kvmem_stagein_enqueue_v(pack.data(), nbytes, dst, sacc)) &&
+            !(dst && kvmem_stagein_h2d_bytes(dst, pack.data(), nbytes))) {
+            kvmem_tensor_set(t, pack.data(), static_cast<size_t>(cell0) * row, nbytes);
         }
         if (retr_.enabled) {
             retr_.set_us += ggml_time_us() - t_set;
@@ -4239,9 +4366,10 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
         }
+        il_cur = il;
         const int64_t t_copy = ggml_time_us();
-        const bool have_k = raw_->copy_k_gpu(block_id, il, kpack.data(), nt);
-        const bool have_v = !v_trans_ && raw_->copy_v_gpu(block_id, il, vpack.data(), nt);
+        const bool have_k = raw_->has_k_gpu(block_id, il);
+        const bool have_v = !v_trans_ && raw_->has_v_gpu(block_id, il);
         if (native_transfer_pending_ && (!have_k || !have_v))
             throw std::runtime_error("KVMem packed K/V read failed");
         if (retr_.enabled) {
@@ -4255,10 +4383,10 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
         uint8_t * kbase = multi_gpu_ ? nullptr : kvmem_cuda_tensor_ptr(kt);
         uint8_t * vbase = multi_gpu_ ? nullptr : (vt && !v_trans_) ? kvmem_cuda_tensor_ptr(vt) : nullptr;
         if (have_k) {
-            write_packed(kt, kbase, kpack.data(), krow, krow * (size_t) nt);
+            write_layer(kt, kbase, true);
         }
         if (have_v) {
-            write_packed(vt, vbase, vpack.data(), vrow, vrow * (size_t) nt);
+            write_layer(vt, vbase, false);
         }
     }
     if (trace_) {
@@ -4282,6 +4410,66 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
             ? std::min(block_tokens_, kv_size_ - cell0) : 0;
     const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
     const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
+    // Async batch: enqueue every layer's K/V as one cudaMemcpyAsync each into
+    // a pinned slab, sync once, then a plain host memcpy into the (pageable)
+    // tier arena. The previous form issued one synchronous get per tensor
+    // (~2 x n_layer round trips per block), which dominated stage-out time.
+    if (stageout_pin_bytes_ < bytes) {
+        if (stageout_pin_ptr_) {
+            cudaFreeHost(stageout_pin_ptr_);
+            stageout_pin_ptr_ = nullptr;
+        }
+        stageout_pin_bytes_ = 0;
+        if (cudaMallocHost(reinterpret_cast<void **>(&stageout_pin_ptr_), bytes) == cudaSuccess) {
+            stageout_pin_bytes_ = bytes;
+        }
+    }
+    uint8_t * slab = stageout_pin_bytes_ >= bytes ? stageout_pin_ptr_ : nullptr;
+    bool async_ok = slab != nullptr;
+    for (uint32_t il = 0; il < n_layer_ && async_ok; ++il) {
+        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+            continue;
+        }
+        ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
+        ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
+        const uint8_t * ksrc = kt ? kvmem_cuda_tensor_ptr(kt) : nullptr;
+        const uint8_t * vsrc = (vt && !v_trans_) ? kvmem_cuda_tensor_ptr(vt) : nullptr;
+        if (kt && nget > 0 && !ksrc) {
+            async_ok = false; // tensor not on a plain device buffer: sync path
+            break;
+        }
+        if (vt && !v_trans_ && nget > 0 && !vsrc) {
+            async_ok = false;
+            break;
+        }
+        if (off + kspan > bytes) {
+            return;
+        }
+        if (ksrc && nget > 0 &&
+            kvmem_copy_async(slab + off, ksrc + static_cast<size_t>(cell0) * krow,
+                             static_cast<size_t>(nget) * krow,
+                             cudaMemcpyDeviceToHost, cudaStreamPerThread) != cudaSuccess) {
+            async_ok = false;
+        }
+        off += kspan;
+        if (off + vspan > bytes) {
+            return;
+        }
+        if (vsrc && nget > 0 &&
+            kvmem_copy_async(slab + off, vsrc + static_cast<size_t>(cell0) * vrow,
+                             static_cast<size_t>(nget) * vrow,
+                             cudaMemcpyDeviceToHost, cudaStreamPerThread) != cudaSuccess) {
+            async_ok = false;
+        }
+        off += vspan;
+    }
+    if (async_ok) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+        memcpy(dst, slab, static_cast<size_t>(bytes));
+        return;
+    }
+    // Fallback: the original synchronous per-tensor path.
+    off = 0;
     for (uint32_t il = 0; il < n_layer_; ++il) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
@@ -4320,6 +4508,75 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
             ? std::min(block_tokens_, kv_size_ - cell0) : 0;
     const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
     const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
+    // Mirror of the stage-out fast path: stage the (pageable) tier bytes into
+    // the pinned slab once, then enqueue every layer's K/V as one async H2D
+    // each and sync once. The per-tensor kvmem_tensor_set form issued ~2 x
+    // n_layer synchronous round trips per block and dominated admit time.
+    if (stageout_pin_bytes_ < bytes) {
+        if (stageout_pin_ptr_) {
+            cudaFreeHost(stageout_pin_ptr_);
+            stageout_pin_ptr_ = nullptr;
+        }
+        stageout_pin_bytes_ = 0;
+        if (cudaMallocHost(reinterpret_cast<void **>(&stageout_pin_ptr_), bytes) == cudaSuccess) {
+            stageout_pin_bytes_ = bytes;
+        }
+    }
+    uint8_t * slab = stageout_pin_bytes_ >= bytes ? stageout_pin_ptr_ : nullptr;
+    bool async_ok = slab != nullptr;
+    if (async_ok) {
+        memcpy(slab, src, static_cast<size_t>(bytes));
+    }
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        if (!async_ok) {
+            break;
+        }
+        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+            continue;
+        }
+        ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
+        ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
+        uint8_t * kdst = kt ? kvmem_cuda_tensor_ptr(kt) : nullptr;
+        uint8_t * vdst = (vt && !v_trans_) ? kvmem_cuda_tensor_ptr(vt) : nullptr;
+        if (kt && nset > 0 && !kdst) {
+            async_ok = false; // tensor not on a plain device buffer: sync path
+            break;
+        }
+        if (vt && !v_trans_ && nset > 0 && !vdst) {
+            async_ok = false;
+            break;
+        }
+        if (off + kspan > bytes) {
+            return;
+        }
+        if (kdst && nset > 0 &&
+            kvmem_copy_async(kdst + static_cast<size_t>(cell0) * krow,
+                             slab + off,
+                             static_cast<size_t>(nset) * krow,
+                             cudaMemcpyHostToDevice, cudaStreamPerThread) != cudaSuccess) {
+            async_ok = false;
+            break;
+        }
+        off += kspan;
+        if (off + vspan > bytes) {
+            return;
+        }
+        if (vdst && nset > 0 &&
+            kvmem_copy_async(vdst + static_cast<size_t>(cell0) * vrow,
+                             slab + off,
+                             static_cast<size_t>(nset) * vrow,
+                             cudaMemcpyHostToDevice, cudaStreamPerThread) != cudaSuccess) {
+            async_ok = false;
+            break;
+        }
+        off += vspan;
+    }
+    if (async_ok) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+        return;
+    }
+    // Fallback: the original synchronous per-tensor path.
+    off = 0;
     for (uint32_t il = 0; il < n_layer_; ++il) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
@@ -5123,7 +5380,7 @@ bool llama_kvmem_want_prefill_capture(void) {
     if (!kp || !kp->enabled) {
         return false;
     }
-    if (kp->method != 1 && !kp->harvest_v && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
+    if (kp->method != 1 && !kp->harvest_v && !kvmem_dump_capture_env()) {
         return false;
     }
     llama_memory_kvmem * mem = kvmem_capture_active();

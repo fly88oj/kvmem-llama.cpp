@@ -66,3 +66,14 @@ bool kvmem_meank_add(uint32_t il, ggml_type ty, const void * gpu_k,
                      uint32_t tok0, uint32_t n_keep, uint32_t n_embd,
                      int64_t ne0, size_t nb0, size_t nb1, size_t nb2);
 bool kvmem_meank_d2h(uint32_t il, float * host, uint32_t n_embd);
+
+bool kvmem_stagein_reserve_v(uint8_t * dst, size_t nbytes, uint8_t ** slot, int64_t * set_us);
+
+// Fused decode-mean add for every managed layer in ONE kernel launch (plus a
+// tiny pinned H2D of the per-layer K pointer table). ktab is indexed by real
+// layer id, nullptr entries are skipped. Requires all non-null entries to
+// share one tensor geometry, checked by the caller. Returns false (caller
+// falls back to per-layer kvmem_meank_add) on any mismatch or launch failure.
+bool kvmem_meank_add_multi(const uint8_t * const * ktab, uint32_t n_tab,
+                            ggml_type ty, uint32_t tok0, uint32_t n_keep,
+                            uint32_t n_embd, int64_t ne0, size_t nb0, size_t nb1, size_t nb2);

@@ -49,18 +49,30 @@ std::vector<double> mean_key_retrieval_scores(const RawKvStore& keys, uint32_t b
     }
     std::vector<double> scores(blocks, 0.0);
     if (!active_layers) return scores;
+    // One lock per block for every layer's cached mean (the per-layer mean_k
+    // path takes a lock per (block, layer) and normalizes under it). Rows
+    // with served == 0 (k_sum still flushing) fall back to the per-layer
+    // path, which owns the flush wait.
+    std::vector<float> key_all(static_cast<size_t>(key_width) * query.layers, 0.0f);
+    std::vector<uint8_t> served(query.layers, 0);
     std::vector<float> key(static_cast<size_t>(key_width));
     for (uint32_t block = 0; block < blocks; ++block) {
         if (!keys.has_block(block)) continue;
+        keys.mean_k_block_layers(block, key_all.data(), query.layers,
+                                 static_cast<uint32_t>(key_width), served.data());
         double total = 0.0;
         for (uint32_t layer = 0; layer < query.layers; ++layer) {
             if (!query.token_counts[layer]) continue;
-            keys.mean_k(block, layer, key.data());
+            const float * key_row = key_all.data() + static_cast<size_t>(layer) * key_width;
+            if (!served[layer]) {
+                keys.mean_k(block, layer, key.data());
+                key_row = key.data();
+            }
             double layer_score = 0.0;
             for (uint32_t head = 0; head < query.kv_heads; ++head) {
                 float norm = 0.0f;
                 for (uint32_t d = 0; d < query.head_dim; ++d) {
-                    const float value = key[head * query.head_dim + d];
+                    const float value = key_row[head * query.head_dim + d];
                     if (!std::isfinite(value)) throw std::invalid_argument("nonfinite mean-key index");
                     norm += value * value;
                 }
@@ -71,7 +83,7 @@ std::vector<double> mean_key_retrieval_scores(const RawKvStore& keys, uint32_t b
                     float dot = 0.0f;
                     for (uint32_t d = 0; d < query.head_dim; ++d)
                         dot += means[layer * probe_width + probe * query.head_dim + d] *
-                            key[head * query.head_dim + d];
+                            key_row[head * query.head_dim + d];
                     const float cosine = dot / (norms[layer * probes + probe] * key_norm + 1e-6f);
                     best = std::max(best, cosine);
                 }

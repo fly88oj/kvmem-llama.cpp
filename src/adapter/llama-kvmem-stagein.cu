@@ -264,6 +264,10 @@ struct MeanKAcc {
     float * acc = nullptr;
     uint32_t n_layer = 0;
     uint32_t n_embd = 0;
+    // Fused multi-layer add: device pointer table (indexed by layer) plus its
+    // pinned staging copy, allocated alongside acc.
+    const uint8_t ** ktab_dev = nullptr;
+    const uint8_t ** ktab_pin = nullptr;
 };
 MeanKAcc & mean_k();
 
@@ -317,6 +321,41 @@ __global__ void meank_add_bf16(const uint8_t * k, float * acc, int tok0, int n_k
 #endif
     }
     acc[d] = s;
+}
+
+// One launch for every managed layer instead of one micro-kernel each.
+// ktab[il] == nullptr skips that layer (same skip the per-layer path takes).
+// ty: 0 = F32, 1 = F16, 2 = BF16 - passed as int to keep the signature trivial.
+__global__ void meank_add_multi_kernel(const uint8_t * const * ktab, float * acc, int tok0, int n_keep,
+                                       int n_embd, int ne0, size_t nb0, size_t nb1, size_t nb2, int ty) {
+    const int il = blockIdx.y;
+    const int d = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    if (d >= n_embd || ne0 <= 0) {
+        return;
+    }
+    const uint8_t * k = ktab[il];
+    if (!k) {
+        return;
+    }
+    float * a = acc + (size_t) il * n_embd;
+    const int head = d / ne0;
+    const int dim = d % ne0;
+    float s = a[d];
+    for (int t = 0; t < n_keep; ++t) {
+        const size_t off = (size_t) (tok0 + t) * nb2 + (size_t) head * nb1 + (size_t) dim * nb0;
+        if (ty == 0) {
+            s += *reinterpret_cast<const float *>(k + off);
+        } else if (ty == 1) {
+            s += __half2float(*reinterpret_cast<const half *>(k + off));
+        } else {
+#if defined(GGML_USE_HIP)
+            s += __bfloat162float(*reinterpret_cast<const nv_bfloat16 *>(k + off));
+#else
+            s += __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(k + off));
+#endif
+        }
+    }
+    a[d] = s;
 }
 
  }  // namespace
@@ -732,20 +771,42 @@ bool kvmem_stagein_flush(int64_t * copy_us, int64_t * rope_us,
         }
     }
     bool ok = true;
-    for (const Item & it : stage().items) {
-        uint8_t * src = stage().dev_q + it.off;
-        if (it.kind == ITEM_V) {
+    // Every plain V item is one contiguous dev_q -> dst copy: batch them all
+    // into a single gather kernel launch (the per-item cudaMemcpyAsync form
+    // paid an enqueue each, ~one per (block, layer) half of the plan).
+    {
+        std::vector<const void *> vsrc;
+        std::vector<void *> vdst;
+        std::vector<size_t> vbytes;
+        for (const Item & it : stage().items) {
+            if (it.kind != ITEM_V) {
+                continue;
+            }
+            vsrc.push_back(stage().dev_q + it.off);
+            vdst.push_back(it.dst);
+            vbytes.push_back(it.nbytes);
+        }
+        if (!vsrc.empty()) {
             const int64_t t0 = ggml_time_us();
-            ok = cuda_ok(kvmem_copy_async(it.dst, src, it.nbytes,
-                                         cudaMemcpyDeviceToDevice, stream()),
-                         "slab V D2D");
+            ok = kvmem_d2d_batched(vsrc.data(), vdst.data(), vbytes.data(), (int) vsrc.size());
+            if (!ok) {
+                // Fallback: per-item async copies (same semantics, more launches).
+                ok = true;
+                for (size_t i = 0; i < vsrc.size() && ok; ++i) {
+                    ok = cuda_ok(kvmem_copy_async(vdst[i], vsrc[i], vbytes[i],
+                                                  cudaMemcpyDeviceToDevice, stream()),
+                                 "slab V D2D");
+                }
+            }
             if (set_us) {
                 *set_us += ggml_time_us() - t0;
             }
-            if (!ok) {
-                break;
-            }
-            continue;
+        }
+    }
+    for (const Item & it : stage().items) {
+        uint8_t * src = stage().dev_q + it.off;
+        if (it.kind == ITEM_V) {
+            continue; // handled by the batched pass above
         }
         {
             const int64_t t0 = ggml_time_us();
@@ -870,6 +931,30 @@ bool kvmem_stagein_enqueue_v(const void * packed, size_t nbytes, uint8_t * dst,
         return false;
     }
     std::memcpy(stage().pin[0] + stage().used, packed, nbytes);
+    Item it;
+    it.off = stage().used;
+    it.nbytes = nbytes;
+    it.dst = dst;
+    it.kind = ITEM_V;
+    stage().items.push_back(it);
+    stage().used += nbytes;
+    return true;
+}
+
+// Reserve nbytes in the stage-in slab and hand the producer the pinned
+// destination directly, skipping a host staging vector (the packed-copy
+// enqueue_v path costs one extra full memcpy per block otherwise).
+bool kvmem_stagein_reserve_v(uint8_t * dst, size_t nbytes, uint8_t ** slot, int64_t * set_us) {
+    if (!dst || nbytes == 0 || !slot) {
+        return false;
+    }
+    if (set_us) {
+        stage().set_us = set_us;
+    }
+    if (!slab_reserve(nbytes, set_us)) {
+        return false;
+    }
+    *slot = stage().pin[0] + stage().used;
     Item it;
     it.off = stage().used;
     it.nbytes = nbytes;
@@ -1065,6 +1150,14 @@ void kvmem_meank_free() {
         cudaFree(mean_k().acc);
         mean_k().acc = nullptr;
     }
+    if (mean_k().ktab_dev) {
+        cudaFree(mean_k().ktab_dev);
+        mean_k().ktab_dev = nullptr;
+    }
+    if (mean_k().ktab_pin) {
+        cudaFreeHost(mean_k().ktab_pin);
+        mean_k().ktab_pin = nullptr;
+    }
     mean_k().n_layer = 0;
     mean_k().n_embd = 0;
 }
@@ -1101,6 +1194,43 @@ bool kvmem_meank_add(uint32_t il, ggml_type ty, const void * gpu_k,
         return false;
     }
     return cuda_ok(cudaGetLastError(), "meank add");
+}
+
+bool kvmem_meank_add_multi(const uint8_t * const * ktab, uint32_t n_tab,
+                            ggml_type ty, uint32_t tok0, uint32_t n_keep,
+                            uint32_t n_embd, int64_t ne0, size_t nb0, size_t nb1, size_t nb2) {
+    if (!mean_k().acc || !ktab || n_keep == 0 || n_embd == 0 || ne0 <= 0 ||
+        n_tab != mean_k().n_layer || n_embd != mean_k().n_embd) {
+        return false;
+    }
+    if (ty != GGML_TYPE_F32 && ty != GGML_TYPE_F16 && ty != GGML_TYPE_BF16) {
+        return false;
+    }
+    const size_t tab_bytes = (size_t) n_tab * sizeof(void *);
+    if (!mean_k().ktab_pin) {
+        if (!cuda_ok(cudaMallocHost(reinterpret_cast<void **>(&mean_k().ktab_pin), tab_bytes), "meank ktab pin")) {
+            return false;
+        }
+    }
+    if (!mean_k().ktab_dev) {
+        if (!cuda_ok(cudaMalloc(reinterpret_cast<void **>(&mean_k().ktab_dev), tab_bytes), "meank ktab dev")) {
+            return false;
+        }
+    }
+    for (uint32_t i = 0; i < n_tab; ++i) {
+        mean_k().ktab_pin[i] = ktab[i];
+    }
+    if (!cuda_ok(kvmem_copy_async(mean_k().ktab_dev, mean_k().ktab_pin, tab_bytes,
+                                  cudaMemcpyHostToDevice, stream()), "meank ktab H2D")) {
+        return false;
+    }
+    const int threads = 64;
+    const int blocks = ((int) n_embd + threads - 1) / threads;
+    dim3 grid(blocks, n_tab);
+    const int ty_i = ty == GGML_TYPE_F32 ? 0 : (ty == GGML_TYPE_F16 ? 1 : 2);
+    meank_add_multi_kernel<<<grid, threads, 0, stream()>>>(mean_k().ktab_dev, mean_k().acc,
+            (int) tok0, (int) n_keep, (int) n_embd, (int) ne0, nb0, nb1, nb2, ty_i);
+    return cuda_ok(cudaGetLastError(), "meank add multi");
 }
 
 bool kvmem_meank_d2h(uint32_t il, float * host, uint32_t n_embd) {

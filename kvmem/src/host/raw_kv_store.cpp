@@ -148,8 +148,12 @@ RawKvStore::~RawKvStore() {
 }
 
 bool RawKvStore::io_sync_inline() const {
-    const char * e = std::getenv("KVMEM_HARVEST_SYNC");
-    return e && e[0] != '\0' && e[0] != '0';
+    // Queried per (block, layer) write during stage-out; cache the lookup.
+    static const bool v = [] {
+        const char * e = std::getenv("KVMEM_HARVEST_SYNC");
+        return e && e[0] != '\0' && e[0] != '0';
+    }();
+    return v;
 }
 
 bool RawKvStore::nvme_enabled() const {
@@ -1044,6 +1048,34 @@ void RawKvStore::mean_k(uint32_t block_id, uint32_t il, float * out) const {
     const float inv = 1.0f / static_cast<float>(nt);
     for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
         out[d] *= inv;
+    }
+}
+
+void RawKvStore::mean_k_block_layers(uint32_t block_id, float * out, uint32_t n_layer,
+                                     uint32_t stride_elems, uint8_t * served) const {
+    if (!out || !served || n_layer == 0) {
+        return;
+    }
+    std::fill_n(served, n_layer, 0);
+    std::lock_guard<std::mutex> lk(mu_);
+    if (block_id >= blocks_.size()) {
+        return;
+    }
+    const BlockRaw & b = blocks_[block_id];
+    const uint32_t nl = std::min(n_layer, static_cast<uint32_t>(b.layers.size()));
+    for (uint32_t il = 0; il < nl; ++il) {
+        const LayerBlk & lb = b.layers[il];
+        float * dst = out + static_cast<size_t>(il) * stride_elems;
+        if (lb.mean_tokens == 0 || lb.k_sum.size() != cfg_.n_embd_k) {
+            std::fill_n(dst, cfg_.n_embd_k, 0.0f);
+            continue;
+        }
+        // Same FP32 reciprocal + multiply as mean_k's cached-mean path.
+        const float inv = 1.0f / static_cast<float>(lb.mean_tokens);
+        for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
+            dst[d] = lb.k_sum[d] * inv;
+        }
+        served[il] = 1;
     }
 }
 

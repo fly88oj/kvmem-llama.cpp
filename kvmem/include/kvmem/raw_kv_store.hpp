@@ -87,6 +87,14 @@ public:
     // Normalize the stored sum by mean_tokens; absent statistics return zeros.
     void mean_k(uint32_t block_id, uint32_t il, float * out) const;
 
+    // Batched mean for one block across ALL layers under a single lock:
+    // out is layer-major with row il at out + il*stride_elems, and served[il]
+    // is set to 1 when the row came from the cached k_sum fast path. Layers
+    // with served == 0 (k_sum still flushing) must go through the per-layer
+    // mean_k fallback, which owns the flush wait.
+    void mean_k_block_layers(uint32_t block_id, float * out, uint32_t n_layer,
+                             uint32_t stride_elems, uint8_t * served) const;
+
     size_t bytes_k() const;
     size_t bytes_v() const;
     size_t allocated_bytes() const;

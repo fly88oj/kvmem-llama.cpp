@@ -94,6 +94,11 @@ public:
         if (target_) target_->note_attention_change();
         return kv_->seq_rm_logical(0, p0, p1);
     }
+    // After a batched seq_rm_logical_ranges on the shared target cache: this
+    // wrapper's kv_ IS that cache, so only the epoch bump remains to do.
+    void note_layout_removed() {
+        if (target_) target_->note_attention_change();
+    }
     // raw_ is null between the two halves of a store swap, and stays null for
     // a conversation whose mirror could not be allocated (attach_conv logs and
     // continues, since the mirror is an accept-rate input and not a

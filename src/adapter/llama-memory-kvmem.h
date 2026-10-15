@@ -486,6 +486,9 @@ private:
     uint32_t decode_mean_pos0_ = 0;
     std::vector<std::vector<float>> decode_mean_host_;
     std::vector<uint8_t> decode_mean_src_; // 0 none, 1 gpu, 2 host
+    std::vector<const uint8_t *> decode_mean_ktab_; // per-layer GPU K pointers for the fused mean add
+    uint8_t * stageout_pin_ptr_ = nullptr;   // pinned slab for batched stage-out D2H
+    uint64_t stageout_pin_bytes_ = 0;
     struct DecodeMeanStats {
         uint32_t n_tok = 0;
         uint32_t n_flush = 0;
