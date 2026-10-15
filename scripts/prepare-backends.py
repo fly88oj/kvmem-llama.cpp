@@ -64,15 +64,36 @@ def prepare(name, entry, check_only):
     head = git(directory, 'rev-parse', 'HEAD').stdout.strip()
     if head != entry['base_commit']:
         raise RuntimeError(f'{name}: expected {entry["base_commit"]}, got {head}')
-    ready = git(directory, 'apply', '--reverse', '--check', str(patch), check=False)
-    if ready.returncode != 0:
+    # Fork overlay patch (fly88oj): applied on top of the pinned upstream
+    # integration patch. Tracked the same way (sha256 in versions.json). The
+    # fork edits sit next to upstream hunks, so upstream's reverse-check
+    # readiness probe no longer matches; apply forward whatever layer is
+    # missing instead.
+    fork_patch = entry.get('fork_patch')
+    if fork_patch:
+        fp = ROOT / fork_patch
+        if hashlib.sha256(fp.read_bytes()).hexdigest() != entry['fork_patch_sha256']:
+            raise RuntimeError(f'{name}: update versions.json after changing the fork patch')
+        if git(directory, 'apply', '--check', str(patch), check=False).returncode == 0:
+            if check_only:
+                raise RuntimeError(f'{name}: integration patch is missing')
+            git(directory, 'apply', '--whitespace=nowarn', str(patch))
+        if git(directory, 'apply', '--check', str(fp), check=False).returncode == 0:
+            if check_only:
+                raise RuntimeError(f'{name}: fork patch is missing')
+            git(directory, 'apply', '--whitespace=nowarn', str(fp))
+        suffix = f' + {fp.name}'
+    else:
+        ready = git(directory, 'apply', '--reverse', '--check', str(patch), check=False)
+        if ready.returncode != 0:
+            if check_only:
+                raise RuntimeError(f'{name}: integration patch is missing or modified')
+            git(directory, 'apply', '--check', str(patch))
+            git(directory, 'apply', '--whitespace=nowarn', str(patch))
         if check_only:
-            raise RuntimeError(f'{name}: integration patch is missing or modified')
-        git(directory, 'apply', '--check', str(patch))
-        git(directory, 'apply', '--whitespace=nowarn', str(patch))
-    if check_only:
-        verify_tree(directory, entry['patched_tree'])
-    print(f'{name}: {head[:12]} + {patch.name} ready', flush=True)
+            verify_tree(directory, entry['patched_tree'])
+        suffix = ''
+    print(f'{name}: {head[:12]} + {patch.name}{suffix} ready', flush=True)
 
 
 def main():

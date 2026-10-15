@@ -36,3 +36,8 @@ CLAUDE.md
 *.nkm
 /dsh-*/
 /results/
+
+# fork local build outputs (upstream layout)
+/build-backends/
+/lmstudio-runtime*/
+/.sync-tmp/

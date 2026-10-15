@@ -1,0 +1,249 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index d8319cd..d52fc57 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1719,7 +1719,20 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     auto cparams = llama_context_default_params();
+ 
+     cparams.n_ctx             = params.n_ctx;
+-    cparams.n_seq_max         = params.n_parallel;
++    // KVMem memory is single-sequence; the LM Studio runtime internalizes the
++    // required --parallel 1 here instead of relying on the launcher to pass it.
++    // Explicitly disabling KVMem (KVMEM_ENABLE=0) restores stock multi-slot
++    // behavior.
++    int32_t n_parallel         = params.n_parallel;
++    {
++        extern "C" const struct llama_kvmem_params * llama_kvmem_get_params(void);
++        if (n_parallel > 1 && llama_kvmem_get_params()->enabled) {
++            fprintf(stderr, "common_context_params_to_llama: KVMem requires a single sequence; clamping --parallel %d -> 1 "
++                            "(set KVMEM_ENABLE=0 to keep multi-slot behavior)\n", (int) n_parallel);
++            n_parallel = 1;
++        }
++    }
++    cparams.n_seq_max         = n_parallel;
+     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 3fc1b96..f6c981d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1504,6 +1504,14 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
+     }
+ }
+ 
++// Read the KVMEM_DUMP_CAPTURE env flag once. Calling getenv() per layer per
++// build_graph is wasteful and is not guaranteed thread-safe alongside a
++// concurrent setenv().
++static bool kvmem_dump_capture() {
++    static const bool dump = getenv("KVMEM_DUMP_CAPTURE") != nullptr;
++    return dump;
++}
++
+ static void kvmem_capture_impl(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * src, int il, const char * tag) {
+ #if defined(LLAMA_KVMEM)
+     const llama_kvmem_params * kp = llama_kvmem_get_params();
+@@ -1512,7 +1520,7 @@ static void kvmem_capture_impl(ggml_context * ctx0, ggml_cgraph * gf, ggml_tenso
+     }
+     // Recency/identity does not need host raw-K. Skip pinning intermediates
+     // unless retrieval is on, harvest-V is on (V only), or an explicit dump.
+-    if (kp->method != 1 && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
++    if (kp->method != 1 && !kvmem_dump_capture()) {
+         if (!kp->harvest_v || tag[0] != 'v') {
+             return;
+         }
+@@ -1575,7 +1583,7 @@ void llm_graph_context::kvmem_capture_v(ggml_tensor * v, int il) const {
+         return;
+     }
+     const llama_kvmem_params * kp = llama_kvmem_get_params();
+-    if (!(kp && kp->harvest_v) && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
++    if (!(kp && kp->harvest_v) && !kvmem_dump_capture()) {
+         return;
+     }
+ #else
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 18d0a40..20afefb 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -404,6 +404,68 @@ bool llama_kv_cache::seq_rm_logical(llama_seq_id seq_id, llama_pos p0, llama_pos
+     return true;
+ }
+ 
++bool llama_kv_cache::seq_rm_logical_ranges(const llama_pos * begins, const llama_pos * ends, size_t n_ranges) {
++    if (n_ranges == 0 || !begins || !ends) {
++        return true;
++    }
++    llama_pos lo = std::numeric_limits<llama_pos>::max();
++    llama_pos hi = std::numeric_limits<llama_pos>::min();
++    for (size_t r = 0; r < n_ranges; ++r) {
++        const llama_pos b = std::max<llama_pos>(begins[r], 0);
++        const llama_pos e = ends[r] < 0 ? std::numeric_limits<llama_pos>::max() : ends[r];
++        if (e <= b) {
++            continue;
++        }
++        lo = std::min(lo, b);
++        hi = std::max(hi, e == std::numeric_limits<llama_pos>::max() ? std::numeric_limits<llama_pos>::max() : e - 1);
++    }
++    if (lo > hi) {
++        return true;
++    }
++    // Membership bitset over the covered span; ranges are 32-token blocks in
++    // practice, so the span is bounded by the number of moved tokens.
++    std::vector<uint64_t> mask;
++    const uint64_t span = (uint64_t) hi - (uint64_t) lo + 1;
++    const bool unbounded = hi == std::numeric_limits<llama_pos>::max();
++    if (!unbounded) {
++        mask.assign((span + 63) / 64, 0);
++        for (size_t r = 0; r < n_ranges; ++r) {
++            const llama_pos b = std::max<llama_pos>(begins[r], 0);
++            const llama_pos e = ends[r] < 0 ? hi + 1 : ends[r];
++            for (llama_pos p = b; p < e; ++p) {
++                const uint64_t u = (uint64_t) p - (uint64_t) lo;
++                mask[u >> 6] |= (uint64_t) 1 << (u & 63);
++            }
++        }
++    }
++    for (uint32_t s = 0; s < n_stream; ++s) {
++        auto & cells = v_cells[s];
++        for (uint32_t i = 0; i < cells.size(); ++i) {
++            if (cells.is_empty(i)) {
++                continue;
++            }
++            const auto logical = cells.ext_get(i).logical_pos;
++            const auto p = logical >= 0 ? logical : cells.pos_get(i);
++            bool hit;
++            if (unbounded) {
++                hit = p >= lo;
++            } else if (p < lo || p > hi) {
++                hit = false;
++            } else {
++                const uint64_t u = (uint64_t) p - (uint64_t) lo;
++                hit = (mask[u >> 6] >> (u & 63)) & 1;
++            }
++            // KVMem only ever removes for sequence 0 (single-slot server).
++            if (!hit || !cells.seq_has(i, 0)) {
++                continue;
++            }
++            cells.seq_rm(i, 0);
++            v_heads[s] = std::min(v_heads[s], i);
++        }
++    }
++    return true;
++}
++
+ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+@@ -1653,12 +1715,20 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+ 
+             // The copy-and-patch shortcut only records cells near seq_pos_min.
+             // KVMem resurrects mid-document holes far below that window; they
+-            // would keep a stale mask (or never be patched). Skip the shortcut
+-            // when [pos_min, pos_max] is not fully populated.
++            // would keep a stale mask (or never be patched), so skip the
++            // shortcut unless [sp_min, sp_max] is exactly, singly populated by
++            // *this* sequence.
++            // note: count cells carrying seq_id, not the whole stream -- the old
++            // get_used() also counted other sequences' cells and hid real holes.
++            // Any mismatch between the cell count and the position span (missing
++            // positions = holes, or repeated positions = duplicates) disables the
++            // shortcut conservatively; computing the full mask is always correct.
++            // The span is int64 to avoid signed overflow when sp_max is near
++            // INT32_MAX.
+             const llama_pos sp_min = cells.seq_pos_min(seq_id);
+             const llama_pos sp_max = cells.seq_pos_max(seq_id);
+-            const bool holes = sp_min >= 0 && sp_max >= sp_min &&
+-                cells.get_used() < (uint32_t) (sp_max - sp_min + 1);
++            const int64_t   sp_span = (sp_min >= 0 && sp_max >= sp_min) ? ((int64_t) sp_max - sp_min + 1) : 0;
++            const bool holes = sp_span > 0 && (int64_t) cells.seq_pos_count(seq_id) != sp_span;
+ 
+             if (!alibi && !holes) {
+                 if (seq_srct.find(seq_id) != seq_srct.end()) {
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 5850e09..661107a 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -170,6 +170,12 @@ public:
+     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+     bool seq_rm_logical(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+ 
++    // KVMem: batched variant of the above for many disjoint [begin, end)
++    // ranges (block-aligned, unordered). One pass over the cells instead of
++    // one full scan per range; membership is tested against a span bitset.
++    // Sequence 0 only (single-slot KVMem server), matching every caller.
++    bool seq_rm_logical_ranges(const llama_pos * begins, const llama_pos * ends, size_t n_ranges);
++
+     // state_read, plus the cells the restored tokens were placed in
+     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
+     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index 969dcd8..1f8f260 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -387,6 +387,17 @@ public:
+         return seq_pos[seq_id].rbegin()->first;
+     }
+ 
++    // number of cells that currently carry sequence seq_id
++    // note: a position may appear in more than one cell (cache reuse via rm+add,
++    // some vision embeddings), so this counts cells, not distinct positions
++    uint32_t seq_pos_count(llama_seq_id seq_id) const {
++        assert(seq_id >= 0);
++        assert(seq_id < LLAMA_MAX_SEQ);
++
++        return (uint32_t) seq_pos[seq_id].size();
++    }
++    }
++
+     // note: call only if the cell is not empty
+     llama_pos pos_get(uint32_t i) const {
+         assert(i < pos.size());
+diff --git a/src/models/gemma4.cpp b/src/models/gemma4.cpp
+index 67de74c..b9ae388 100644
+--- a/src/models/gemma4.cpp
++++ b/src/models/gemma4.cpp
+@@ -224,6 +224,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
+             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+             cb(Qcur, "Qcur_normed", il);
+ 
++            kvmem_capture_q(Qcur, il);
++
+             Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+                                  ext_factor, attn_factor, beta_fast, beta_slow);
+             cb(Qcur, "Qcur_pos", il);
+@@ -258,6 +260,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
+             cb(Kcur, "Kcur_normed", il);
+             cb(Vcur, "Vcur_normed", il);
+ 
++            // pre-rope K for KVMem retrieval scoring (SWA layers are filtered
++            // inside register_capture; they roll out of the window anyway)
++            kvmem_capture_k(Kcur, il);
++
+             Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+                                  ext_factor, attn_factor, beta_fast, beta_slow);
+ 
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 049bdce..530a56e 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -161,6 +161,20 @@ int llama_server(common_params & params, int argc, char ** argv) {
+         }
+     }
+ 
++    // KVMem runtime internalization: the bounded-window memory is single-sequence.
++    // Clamp any --parallel > 1 (LM Studio passes 4 by default) instead of letting
++    // the memory silently fall back to the unbounded stock cache. KVMEM_ENABLE=0
++    // keeps stock multi-slot behavior. Runs before the auto KV-pool sizing below
++    // so the pool is sized for one slot.
++    {
++        extern "C" const struct llama_kvmem_params * llama_kvmem_get_params(void);
++        if (params.n_parallel > 1 && llama_kvmem_get_params()->enabled) {
++            SRV_WRN("KVMem requires a single sequence: clamping --parallel %d -> 1 "
++                    "(set KVMEM_ENABLE=0 to keep multi-slot behavior)\n", params.n_parallel);
++            params.n_parallel = 1;
++        }
++    }
++
+     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
+     // or with -c 0 for max context
+     const bool ctx_pool_auto_sized = params.kv_unified_per_slot > 0 &&

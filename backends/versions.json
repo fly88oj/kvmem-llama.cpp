@@ -8,7 +8,10 @@
     "local_changes": "KVMem integration is maintained in the versioned patch; the submodule remains pinned to base_commit",
     "patch": "backends/patches/llamacpp-kvmem.patch",
     "patch_sha256": "6004bd7d148f1a4eb10ed816be81228fdff5d9686bac90374f55c2f4bc2494b5",
-    "patched_tree": "b190e67570206f5f1aa8c2adbc1cb05c914d9354"
+    "patched_tree": "b190e67570206f5f1aa8c2adbc1cb05c914d9354",
+    "fork_patch": "backends/patches/llamacpp-kvmem-fork.patch",
+    "fork_patch_sha256": "3c959a4b586fe4215a97a63b984a2f71b6add133a5d2cf7e0cfa4421ef128c4c",
+    "fork_local_changes": "fork extras on top of the pinned patch: gemma4 capture hooks, batched seq_rm_logical_ranges, kv-cells holes fix, getenv caching, LM Studio parallel clamp (KVMEM_ENABLE=0 restores stock multi-slot)"
   },
   "ninfer": {
     "path": "backends/ninfer",
