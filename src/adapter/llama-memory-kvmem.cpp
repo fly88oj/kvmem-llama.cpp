@@ -468,6 +468,99 @@ static bool kvmem_env_perf() {
     return v == 1;
 }
 
+// ---------------------------------------------------------------------------
+// Environment bridge: lets stock llama.cpp binaries (e.g. an LM Studio
+// runtime build of llama-server) enable/configure KVMem without CLI flags.
+// The host process inherits the user's environment, so `setx KVMEM_ENABLE 1`
+// (plus optional KVMEM_* knobs) is enough. Values set explicitly via
+// llama_kvmem_set_params keep priority: env only fills from the current state.
+// ---------------------------------------------------------------------------
+static bool g_kvmem_env_applied = false;
+static std::string g_kvmem_env_nvme_dir;
+static std::string g_kvmem_env_payload_dir;
+
+static void llama_kvmem_apply_env_once() {
+    if (g_kvmem_env_applied) {
+        return;
+    }
+    g_kvmem_env_applied = true;
+    // Tri-state KVMEM_ENABLE: unset -> build default (KVMEM_DEFAULT_ON builds,
+    // e.g. the LM Studio dedicated runtime, start enabled); "0" forces off; "1" forces on.
+    const char * enable = getenv("KVMEM_ENABLE");
+    bool on;
+    if (enable && *enable) {
+        on = (*enable == '1' || *enable == 't' || *enable == 'T' || *enable == 'y' || *enable == 'Y');
+    } else {
+#if defined(KVMEM_DEFAULT_ON)
+        on = true;
+#else
+        on = false;
+#endif
+    }
+    if (!on) {
+        return;
+    }
+    llama_kvmem_params p = kvmem_current_execution().params;
+    p.enabled = true;
+    // stock binaries never set a method; the CLI default is retrieval (1)
+    if (!getenv("KVMEM_METHOD")) {
+        p.method = 1;
+    }
+    auto u32 = [](const char * name, uint32_t & f) {
+        if (const char * v = getenv(name)) { f = (uint32_t) strtoul(v, nullptr, 10); }
+    };
+    auto i32 = [](const char * name, int32_t & f) {
+        if (const char * v = getenv(name)) { f = (int32_t) strtol(v, nullptr, 10); }
+    };
+    auto f64 = [](const char * name, double & f) {
+        if (const char * v = getenv(name)) { f = strtod(v, nullptr); }
+    };
+    auto u64 = [](const char * name, uint64_t & f) {
+        if (const char * v = getenv(name)) { f = (uint64_t) strtoull(v, nullptr, 10); }
+    };
+    auto b   = [](const char * name, bool & f) {
+        if (const char * v = getenv(name)) { f = (*v == '1' || *v == 't' || *v == 'T'); }
+    };
+    u32("KVMEM_BUDGET",         p.budget);
+    u32("KVMEM_GEN_RESERVE",    p.gen_reserve);
+    u32("KVMEM_BLOCK_TOKENS",   p.block_tokens);
+    u32("KVMEM_SINK_TOKENS",    p.sink_tokens);
+    u32("KVMEM_RECENT_TOKENS",  p.recent_tokens);
+    i32("KVMEM_METHOD",         p.method);
+    i32("KVMEM_MTP_STATE",      p.mtp_state);
+    i32("KVMEM_SCORE_AGG",      p.score_agg);
+    {
+        if (const char * v = getenv("KVMEM_GPU_RATIO"))   { p.gpu_memory_ratio   = strtof(v, nullptr); }
+        if (const char * v = getenv("KVMEM_GPU_HIGH"))    { p.gpu_high_watermark = strtof(v, nullptr); }
+        if (const char * v = getenv("KVMEM_GPU_LOW"))     { p.gpu_low_watermark  = strtof(v, nullptr); }
+    }
+    b  ("KVMEM_LRFU",           p.lrfu);
+    f64("KVMEM_LRFU_LAMBDA",    p.lrfu_lambda);
+    f64("KVMEM_LRFU_TOP",       p.lrfu_top_fraction);
+    u64("KVMEM_CPU_BYTES",      p.cpu_bytes);
+    u64("KVMEM_NVME_BYTES",     p.nvme_bytes);
+    u64("KVMEM_PAYLOAD_HOST_BYTES", p.payload_host_bytes);
+    u64("KVMEM_PAYLOAD_DISK_BYTES", p.payload_disk_bytes);
+    b  ("KVMEM_HARVEST_V",      p.harvest_v);
+    b  ("KVMEM_RAW_K_NVME",     p.raw_k_nvme);
+    if (const char * v = getenv("KVMEM_NVME_DIR")) {
+        g_kvmem_env_nvme_dir = v;
+        p.nvme_dir = g_kvmem_env_nvme_dir.c_str();
+    }
+    if (const char * v = getenv("KVMEM_PAYLOAD_DISK_DIR")) {
+        g_kvmem_env_payload_dir = v;
+        p.payload_disk_dir = g_kvmem_env_payload_dir.c_str();
+    }
+    // dedicated-runtime defaults (RTX 4090 / 24 GB validated); env values above win
+    if (!getenv("KVMEM_BUDGET") && p.budget == 0) {
+        p.budget = 32768;
+    }
+    if (!getenv("KVMEM_GEN_RESERVE") && p.gen_reserve == 0) {
+        p.gen_reserve = 16384;
+    }
+    kvmem_current_execution().params = p;
+}
+
 void llama_kvmem_set_params(const struct llama_kvmem_params * params) {
     auto & execution = kvmem_current_execution();
     if (!execution.memory && !execution.mtp) execution.payload_storage.reset();
@@ -479,6 +572,7 @@ void llama_kvmem_set_params(const struct llama_kvmem_params * params) {
 }
 
 const struct llama_kvmem_params * llama_kvmem_get_params(void) {
+    llama_kvmem_apply_env_once();
     return &kvmem_current_execution().params;
 }
 
@@ -858,6 +952,7 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         const llama_model & model,
         const llama_memory_params & params,
         const llama_cparams & cparams) {
+    llama_kvmem_apply_env_once();
     if (!kvmem_current_execution().params.enabled) {
         return nullptr;
     }
@@ -893,6 +988,43 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
                 __func__, cparams.n_seq_max);
         return nullptr;
     }
+    // Internalized KV type for the bounded slot-pool: launchers that only know stock
+    // flags pass f16 caches (--cache-type-k/-v defaults). KVMEM_CACHE_TYPE overrides
+    // explicitly (f16|f32|q8_0|q5_0|q4_0); in KVMEM_DEFAULT_ON builds an f16 default
+    // is lowered to q8_0 to match the validated llama-kvmem-server recipe (half the
+    // pool VRAM, measured quality-neutral). Non-f16 caller choices are respected as-is;
+    // KVMEM_CACHE_TYPE=f16 explicitly keeps f16 (a plain f16 flag is indistinguishable
+    // from the launcher default, so it is lowered too).
+    llama_memory_params mp = params;
+    {
+        ggml_type want_k = mp.type_k;
+        ggml_type want_v = mp.type_v;
+        if (const char * e = getenv("KVMEM_CACHE_TYPE")) {
+            ggml_type t = GGML_TYPE_COUNT;
+            if      (!strcmp(e, "f16"))  { t = GGML_TYPE_F16; }
+            else if (!strcmp(e, "f32"))  { t = GGML_TYPE_F32; }
+            else if (!strcmp(e, "q8_0")) { t = GGML_TYPE_Q8_0; }
+            else if (!strcmp(e, "q5_0")) { t = GGML_TYPE_Q5_0; }
+            else if (!strcmp(e, "q4_0")) { t = GGML_TYPE_Q4_0; }
+            if (t != GGML_TYPE_COUNT) {
+                want_k = t;
+                want_v = t;
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring unknown KVMEM_CACHE_TYPE=%s\n", __func__, e);
+            }
+        } else {
+#if defined(KVMEM_DEFAULT_ON)
+            if (want_k == GGML_TYPE_F16 && want_v == GGML_TYPE_F16) {
+                LLAMA_LOG_INFO("%s: slot-pool KV type f16 -> q8_0 (KVMEM runtime default; "
+                               "set KVMEM_CACHE_TYPE=f16 to keep f16)\n", __func__);
+                want_k = GGML_TYPE_Q8_0;
+                want_v = GGML_TYPE_Q8_0;
+            }
+#endif
+        }
+        mp.type_k = want_k;
+        mp.type_v = want_v;
+    }
     if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         if (llm_arch_is_hybrid(model.arch)) {
             LLAMA_LOG_WARN("%s: KVMem skips SWA+recurrent hybrid models\n", __func__);
@@ -914,12 +1046,12 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         // layers keep the stock rolling window (the iswa swa cache). A single
         // mixed-geometry cache is NOT viable (kv_cache rope/uniformity
         // assumptions break during graph reserve).
-        return new llama_memory_kvmem_swa(model, params, cparams);
+        return new llama_memory_kvmem_swa(model, mp, cparams);
     }
     if (llm_arch_is_hybrid(model.arch)) {
-        return new llama_memory_kvmem_hybrid(model, params, cparams);
+        return new llama_memory_kvmem_hybrid(model, mp, cparams);
     }
-    return new llama_memory_kvmem(model, params, cparams);
+    return new llama_memory_kvmem(model, mp, cparams);
 }
 
 llama_memory_kvmem::llama_memory_kvmem(
