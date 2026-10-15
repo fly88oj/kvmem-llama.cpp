@@ -1,8 +1,16 @@
 diff --git a/common/common.cpp b/common/common.cpp
-index d8319cd..d52fc57 100644
+index d8319cd..e71ea9d 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1719,7 +1719,20 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1715,11 +1715,25 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+     return mparams;
+ }
+ 
++// KVMem adapter hook (implemented out-of-tree in src/adapter/): a minimal
++// bool probe so this TU needs neither the adapter headers nor its structs.
++extern "C" bool llama_kvmem_enabled(void);
++
+ struct llama_context_params common_context_params_to_llama(const common_params & params) {
      auto cparams = llama_context_default_params();
  
      cparams.n_ctx             = params.n_ctx;
@@ -12,13 +20,10 @@ index d8319cd..d52fc57 100644
 +    // Explicitly disabling KVMem (KVMEM_ENABLE=0) restores stock multi-slot
 +    // behavior.
 +    int32_t n_parallel         = params.n_parallel;
-+    {
-+        extern "C" const struct llama_kvmem_params * llama_kvmem_get_params(void);
-+        if (n_parallel > 1 && llama_kvmem_get_params()->enabled) {
-+            fprintf(stderr, "common_context_params_to_llama: KVMem requires a single sequence; clamping --parallel %d -> 1 "
-+                            "(set KVMEM_ENABLE=0 to keep multi-slot behavior)\n", (int) n_parallel);
-+            n_parallel = 1;
-+        }
++    if (n_parallel > 1 && llama_kvmem_enabled()) {
++        fprintf(stderr, "common_context_params_to_llama: KVMem requires a single sequence; clamping --parallel %d -> 1 "
++                        "(set KVMEM_ENABLE=0 to keep multi-slot behavior)\n", (int) n_parallel);
++        n_parallel = 1;
 +    }
 +    cparams.n_seq_max         = n_parallel;
      cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
@@ -222,10 +227,21 @@ index 67de74c..b9ae388 100644
                                   ext_factor, attn_factor, beta_fast, beta_slow);
  
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index 049bdce..530a56e 100644
+index 049bdce..b3efd8f 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
-@@ -161,6 +161,20 @@ int llama_server(common_params & params, int argc, char ** argv) {
+@@ -39,6 +39,10 @@ static inline void signal_handler(int signal) {
+ // satisfies -Wmissing-declarations (used by llama command)
+ int llama_server(int argc, char ** argv);
+ 
++// KVMem adapter hook (implemented out-of-tree in src/adapter/): a minimal
++// bool probe so this TU needs neither the adapter headers nor its structs.
++extern "C" bool llama_kvmem_enabled(void);
++
+ // to be used via CLI (argc / argv are used by router mode only)
+ int llama_server(common_params & params, int argc, char ** argv);
+ void llama_server_terminate();
+@@ -161,6 +165,17 @@ int llama_server(common_params & params, int argc, char ** argv) {
          }
      }
  
@@ -234,13 +250,10 @@ index 049bdce..530a56e 100644
 +    // the memory silently fall back to the unbounded stock cache. KVMEM_ENABLE=0
 +    // keeps stock multi-slot behavior. Runs before the auto KV-pool sizing below
 +    // so the pool is sized for one slot.
-+    {
-+        extern "C" const struct llama_kvmem_params * llama_kvmem_get_params(void);
-+        if (params.n_parallel > 1 && llama_kvmem_get_params()->enabled) {
-+            SRV_WRN("KVMem requires a single sequence: clamping --parallel %d -> 1 "
-+                    "(set KVMEM_ENABLE=0 to keep multi-slot behavior)\n", params.n_parallel);
-+            params.n_parallel = 1;
-+        }
++    if (params.n_parallel > 1 && llama_kvmem_enabled()) {
++        SRV_WRN("KVMem requires a single sequence: clamping --parallel %d -> 1 "
++                "(set KVMEM_ENABLE=0 to keep multi-slot behavior)\n", params.n_parallel);
++        params.n_parallel = 1;
 +    }
 +
      // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c

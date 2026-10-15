@@ -576,6 +576,12 @@ const struct llama_kvmem_params * llama_kvmem_get_params(void) {
     return &kvmem_current_execution().params;
 }
 
+// Minimal C probe for out-of-tree hook sites (common/server clamp) that must
+// not depend on the adapter's headers: just "is KVMem enabled right now".
+extern "C" LLAMA_API bool llama_kvmem_enabled(void) {
+    return llama_kvmem_get_params()->enabled;
+}
+
 static uint32_t kvmem_align_tokens(uint32_t tokens, uint32_t block_tokens) {
     if (block_tokens == 0) {
         return 0;
