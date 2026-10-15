@@ -804,6 +804,11 @@ bool kvmem_stagein_flush(int64_t * copy_us, int64_t * rope_us,
         }
     }
     for (const Item & it : stage().items) {
+        // A failed V pass must carry through: the K steps below assign ok
+        // unconditionally and would mask it, letting a stale slab through.
+        if (!ok) {
+            break;
+        }
         uint8_t * src = stage().dev_q + it.off;
         if (it.kind == ITEM_V) {
             continue; // handled by the batched pass above

@@ -536,6 +536,11 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
     bool ok = true;
     const int ng = (int) gsrc.size();
     if (ng > 0 && !kvmem_d2d_batched(gsrc.data(), gdst.data(), gbytes.data(), ng)) {
+        // The batched path runs on the (non-blocking) execution stream while
+        // this fallback uses the legacy default stream; the two have no
+        // implicit ordering, so flush whatever the batched launch enqueued
+        // before redoing the work per-item. Error path only - no hot cost.
+        cudaDeviceSynchronize();
         for (int j = 0; j < ng && ok; ++j) {
             ok = kvmem_copy_async(gdst[j], gsrc[j], gbytes[j],
                                  cudaMemcpyDeviceToDevice) == cudaSuccess;
@@ -543,6 +548,7 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
     }
     const int ns = (int) ssrc.size();
     if (ok && ns > 0 && !kvmem_d2d_batched(ssrc.data(), sdst.data(), sbytes.data(), ns)) {
+        cudaDeviceSynchronize();
         for (int j = 0; j < ns && ok; ++j) {
             ok = kvmem_copy_async(sdst[j], ssrc[j], sbytes[j],
                                  cudaMemcpyDeviceToDevice) == cudaSuccess;
