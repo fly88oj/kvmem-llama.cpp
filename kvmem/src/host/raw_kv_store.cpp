@@ -1,12 +1,9 @@
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/snapshot.hpp"
 #include "kvmem/snapshot_buffer.hpp"
-#if defined(_WIN32)
-// The POSIX implementation cannot be built on Windows; see the header.
-#include "kvmem/nvme_kv_tier_win.hpp"
-#else
+// The Win32 platform layer (src/host/nvme_platform.cpp) implements the same
+// positional-I/O contract, so the real tier header builds on Windows too.
 #include "kvmem/nvme_kv_tier.hpp"
-#endif
 
 #include <algorithm>
 #include <cstdio>

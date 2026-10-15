@@ -534,7 +534,14 @@ static kvmem::KvMemRuntimeConfig make_runtime_cfg(
         if (kvmem_current_execution().params.nvme_dir && kvmem_current_execution().params.nvme_dir[0]) {
             cfg.nvme_dir = kvmem_current_execution().params.nvme_dir;
         } else if (cfg.nvme_bytes > 0) {
+#ifdef _WIN32
+            // /tmp does not exist on Windows; use the per-user TEMP root so
+            // the Win32 platform layer can create the arena there.
+            const char * temp = getenv("TEMP");
+            cfg.nvme_dir = temp && temp[0] ? std::string(temp) + "\\kvmem_nvme" : ".\\kvmem_nvme";
+#else
             cfg.nvme_dir = "/tmp/kvmem_nvme";
+#endif
         }
     }
     return cfg;

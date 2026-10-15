@@ -11,7 +11,13 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <io.h>
+#define access _access
+#define F_OK 0
+#else
 #include <unistd.h>
+#endif
 
 using namespace kvmem;
 
@@ -25,7 +31,12 @@ static int g_fail = 0;
 
 static std::string temp_dir() {
     const char *base = std::getenv("TMPDIR");
+#ifdef _WIN32
+    if (!base) base = std::getenv("TEMP");
+    if (!base) base = ".";
+#else
     if (!base) base = "/tmp";
+#endif
     return std::string(base) + "/qw3_nvme_kv_tier_test";
 }
 

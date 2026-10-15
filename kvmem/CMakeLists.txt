@@ -1,12 +1,4 @@
-if (WIN32)
-    set(KVMEM_NVME_DEFAULT OFF)
-else()
-    set(KVMEM_NVME_DEFAULT ON)
-endif()
-option(KVMEM_ENABLE_NVME "Build the POSIX NVMe KV storage tier" ${KVMEM_NVME_DEFAULT})
-if (WIN32 AND KVMEM_ENABLE_NVME)
-    message(FATAL_ERROR "NVMe storage is not supported on Windows; use KVMEM_ENABLE_NVME=OFF")
-endif()
+option(KVMEM_ENABLE_NVME "Build the NVMe/SSD KV storage tier (POSIX and Win32)" ON)
 
 add_library(kvmem
     src/host/kvmem_store.cpp
@@ -21,6 +13,11 @@ add_library(kvmem
     src/host/session_memory.cpp
     src/host/rope.cpp
 )
+if (KVMEM_ENABLE_NVME)
+    # Platform I/O primitives for the NVMe tier; only compiled when the tier
+    # is built. windows.h / the POSIX headers stay confined to this TU.
+    target_sources(kvmem PRIVATE src/host/nvme_platform.cpp)
+endif()
 set_target_properties(kvmem PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(kvmem PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(kvmem PUBLIC cxx_std_17)
@@ -59,18 +56,15 @@ kvmem_add_test(tiered_kv_storage_test)
 kvmem_add_test(native_residency_test)
 kvmem_add_test(kv_content_test)
 kvmem_add_test(mean_key_retrieval_test)
-if (NOT WIN32 OR NOT KVMEM_ENABLE_NVME)
-    # The runtime suite already guards its only NVMe case with this option.
-    kvmem_add_test(kvmem_runtime_test)
-endif()
-if (WIN32)
-    # NVMe-specific suites require the POSIX implementation.
-    message(STATUS "kvmem: skipping POSIX/NVMe suites on Windows")
+# The runtime suite's only NVMe case is guarded by the KVMEM_ENABLE_NVME
+# option, and the Win32 platform layer satisfies the tier contract, so it
+# runs everywhere.
+kvmem_add_test(kvmem_runtime_test)
+# The Win32 platform layer satisfies the tier's positional-I/O contract, so
+# the NVMe suites run on every platform that builds the tier.
+if (KVMEM_ENABLE_NVME)
+    kvmem_add_test(nvme_kv_tier_test)
 else()
-    if (KVMEM_ENABLE_NVME)
-        kvmem_add_test(nvme_kv_tier_test)
-    else()
-        kvmem_add_test(nvme_disabled_test)
-    endif()
-    kvmem_add_test(raw_kv_store_test)
+    kvmem_add_test(nvme_disabled_test)
 endif()
+kvmem_add_test(raw_kv_store_test)
