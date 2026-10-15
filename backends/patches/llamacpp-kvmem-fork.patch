@@ -177,10 +177,10 @@ index 5850e09..661107a 100644
      // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
      //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
 diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
-index 969dcd8..1f8f260 100644
+index 969dcd8..566b46b 100644
 --- a/src/llama-kv-cells.h
 +++ b/src/llama-kv-cells.h
-@@ -387,6 +387,17 @@ public:
+@@ -387,6 +387,16 @@ public:
          return seq_pos[seq_id].rbegin()->first;
      }
  
@@ -192,7 +192,6 @@ index 969dcd8..1f8f260 100644
 +        assert(seq_id < LLAMA_MAX_SEQ);
 +
 +        return (uint32_t) seq_pos[seq_id].size();
-+    }
 +    }
 +
      // note: call only if the cell is not empty
