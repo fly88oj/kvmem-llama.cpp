@@ -559,10 +559,22 @@ static bool kvmem_cache_has_layer(const llama_kv_cache * kv, int32_t il) {
     return false;
 }
 
+// A layer is slot-pool MANAGED only if it is attention-based, not a sliding
+// window layer, and actually owns a KV cache (gemma KV-sharing layers reuse
+// an earlier layer's cache and must not inflate the slot layout). For dense
+// and recurrent-hybrid models this is equivalent to !is_recr(il), so the
+// stock (non-SWA) paths are unchanged.
+static bool kvmem_layer_is_managed(const llama_model & model, uint32_t il) {
+    return !model.hparams.is_recr(il) && !model.hparams.is_swa(il) &&
+           model.hparams.has_kv(il);
+}
+
 static uint32_t kvmem_first_attn_layer(const llama_model & model) {
+    // First MANAGED attention layer (see kvmem_layer_is_managed). The
+    // slot-pool layout takes its K/V geometry from this layer.
     const uint32_t n = model.hparams.n_layer();
     for (uint32_t il = 0; il < n; ++il) {
-        if (!model.hparams.is_recr(il)) {
+        if (kvmem_layer_is_managed(model, il)) {
             return il;
         }
     }
@@ -570,10 +582,11 @@ static uint32_t kvmem_first_attn_layer(const llama_model & model) {
 }
 
 static uint32_t kvmem_n_attn_layers(const llama_model & model) {
+    // Count of MANAGED attention layers (see kvmem_layer_is_managed).
     const uint32_t n = model.hparams.n_layer();
     uint32_t c = 0;
     for (uint32_t il = 0; il < n; ++il) {
-        if (!model.hparams.is_recr(il)) {
+        if (kvmem_layer_is_managed(model, il)) {
             ++c;
         }
     }
@@ -844,6 +857,13 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
             llama_memory_t mem = llama_get_memory(cparams.ctx_other);
             if (auto * hyb = dynamic_cast<llama_memory_kvmem_hybrid *>(mem)) {
                 tgt = hyb->attn_kvmem();
+            } else if (auto * swa = dynamic_cast<llama_memory_kvmem_swa *>(mem)) {
+                // Stock draft creation would wire the assistant share-callback
+                // straight onto the SWA target's slot-pooled base cache and
+                // write through it uncoordinated. Reject loudly instead.
+                LLAMA_LOG_ERROR("%s: KVMem MTP draft over a SWA slot-pool target is not supported"
+                        " - disable KVMem for this pairing\n", __func__);
+                return nullptr;
             } else {
                 tgt = dynamic_cast<llama_memory_kvmem *>(mem);
             }
@@ -864,8 +884,27 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         return nullptr;
     }
     if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        LLAMA_LOG_WARN("%s: KVMem skips SWA models\n", __func__);
-        return nullptr;
+        if (llm_arch_is_hybrid(model.arch)) {
+            LLAMA_LOG_WARN("%s: KVMem skips SWA+recurrent hybrid models\n", __func__);
+            return nullptr;
+        }
+        bool any_managed = false;
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            if (kvmem_layer_is_managed(model, il)) {
+                any_managed = true;
+                break;
+            }
+        }
+        if (!any_managed) {
+            LLAMA_LOG_WARN("%s: KVMem skips fully-SWA models (no dense layers to manage)\n", __func__);
+            return nullptr;
+        }
+        // gemma3/gemma4-style interleaved SWA: the dense/global layers become
+        // a KVMem slot-pool (the iswa base cache, uniform geometry); the SWA
+        // layers keep the stock rolling window (the iswa swa cache). A single
+        // mixed-geometry cache is NOT viable (kv_cache rope/uniformity
+        // assumptions break during graph reserve).
+        return new llama_memory_kvmem_swa(model, params, cparams);
     }
     if (llm_arch_is_hybrid(model.arch)) {
         return new llama_memory_kvmem_hybrid(model, params, cparams);
@@ -2639,6 +2678,15 @@ void llama_memory_kvmem::note_ubatch_pos(const std::vector<llama_pos> & pos) {
 
 void llama_memory_kvmem::register_capture(ggml_tensor * t, int il, char which) {
     if (!t) {
+        return;
+    }
+    if (il < 0 || !model_.hparams.has_kv(static_cast<uint32_t>(il)) ||
+            model_.hparams.is_swa(static_cast<uint32_t>(il))) {
+        // One filter at the single registration entry covers every capture
+        // consumer (host harvest, GPU harvest fallback, decode-mean): SWA
+        // head geometry differs from the managed-layer scorer buffers and
+        // their far-token K is never staged back; KV-shared layers own no K
+        // snapshot for the scorer to match against.
         return;
     }
     pending_capture_.push_back({t, il, which});
@@ -5239,6 +5287,9 @@ llama_pos llama_kvmem_model_pos(uint32_t logical) {
 }
 
 bool llama_kvmem_remove_logical(llama_context * ctx, llama_pos begin, llama_pos end) {
+    if (auto * swa = dynamic_cast<llama_memory_kvmem_swa *>(llama_get_memory(ctx))) {
+        return swa->remove_logical(ctx, begin, end);
+    }
     auto * mem = kvmem_capture_active();
     if (mem) return mem->remove_logical(ctx, begin, end);
     auto * native = llama_get_memory(ctx);
@@ -5897,4 +5948,191 @@ void llama_memory_kvmem::run_native_transaction(const std::vector<uint32_t> & se
     session.prepare(backend->stamp(), committed, {}, budget);
     while (session.phase() != kvmem::MemoryPhase::Ready) session.advance();
     session.publish();
+}
+
+// ---------------------------------------------------------------------------
+// llama_memory_kvmem_swa - gemma-style interleaved SWA support.
+//
+// Stock iswa memory holds two uniform-geometry kv caches: kv_base (dense/
+// global layers) and kv_swa (rolling window layers). This variant borrows
+// kv_base into a KVMem slot-pool (bounded cells, block eviction, retrieval,
+// host/NVMe tiers) while kv_swa keeps the native rolling window. Mirrors
+// llama_memory_kvmem_hybrid, which does the same for the attention half of
+// recurrent hybrids.
+// ---------------------------------------------------------------------------
+
+static uint32_t kvmem_swa_base_cells(const llama_model & model,
+                                     const llama_memory_params & params,
+                                     const llama_cparams & cparams) {
+    // iswa sizes the SWA cache as min(base_cells, n_swa*n_seq + n_ubatch):
+    // a KVMem budget smaller than the rolling window would truncate the SWA
+    // cache and fail every prepare(). Floor the base at the window need; the
+    // slot-pool re-derives its slot count from the borrowed cache size.
+    const uint32_t pool = llama_kvmem_pool_cells(model, params, cparams);
+    const uint32_t swa_min = model.hparams.n_swa * std::max(1u, cparams.n_seq_max)
+                           + cparams.n_ubatch;
+    return std::max(pool, swa_min);
+}
+
+// gemma3n/gemma4 KV-sharing (E2B/E4B-style): layers at or past
+// n_layer_kv_from_start reuse the last dense / last SWA layer's KV instead of
+// owning their own cache. Replicated exactly from llama-model.cpp's stock
+// reuse callback; for models without KV sharing (n_layer_kv_from_start ==
+// n_layer) every lookup returns -1 (no-op), same as stock. Shared across
+// both iswa sub-caches because the remap uses absolute layer ids into
+// map_layer_ids, which each cache populates for exactly its own (filter-ed)
+// layers - and both shared-layer classes always land in the same half.
+static llama_memory_i::layer_reuse_cb kvmem_swa_reuse_cb(const llama_model & model) {
+    if (model.arch != LLM_ARCH_GEMMA3N && model.arch != LLM_ARCH_GEMMA4) {
+        return nullptr;
+    }
+    const llama_hparams * hp = &model.hparams;
+    return [hp](uint32_t il) {
+        GGML_ASSERT(hp->n_layer_kv_from_start >= 2);
+
+        if (il >= (uint32_t) hp->n_layer_kv_from_start) {
+            return hp->n_layer_kv_from_start - (hp->is_swa(il) ? 2 : 1);
+        }
+
+        return -1;
+    };
+}
+
+llama_memory_kvmem_swa::llama_memory_kvmem_swa(
+        const llama_model & model,
+        const llama_memory_params & params,
+        const llama_cparams & cparams) :
+    llama_kv_cache_iswa(
+            model,
+            params.type_k,
+            params.type_v,
+            !cparams.flash_attn,
+            cparams.offload_kqv,
+            params.swa_full,
+            /* unified */ true,
+            kvmem_swa_base_cells(model, params, cparams),
+            std::max((uint32_t) 1, cparams.n_seq_max),
+            cparams.n_ubatch,
+            /* n_pad */ 1,
+            /* mem_other */ nullptr,
+            /* filter */ nullptr,
+            kvmem_swa_reuse_cb(model),
+            /* share */ nullptr) {
+    attn_kvmem_ = std::make_unique<llama_memory_kvmem>(
+            model, params, cparams, get_base());
+    LLAMA_LOG_INFO("%s: KVMem SWA (base=slot-pool swa=stock-window) n_dense_layers=%u\n",
+            __func__, kvmem_n_attn_layers(model));
+}
+
+llama_memory_context_ptr llama_memory_kvmem_swa::init_batch(
+        llama_batch_allocr & balloc,
+        uint32_t n_ubatch,
+        bool embd_all) {
+    GGML_UNUSED(embd_all);
+
+    do {
+        balloc.split_reset();
+
+        std::vector<llama_ubatch> ubatches;
+        while (true) {
+            auto ubatch = balloc.split_simple(n_ubatch);
+            if (ubatch.n_tokens == 0) {
+                break;
+            }
+            ubatches.push_back(std::move(ubatch));
+        }
+
+        if (balloc.get_n_used() < balloc.get_n_tokens()) {
+            break;
+        }
+
+        // KVMem owns the base cache: retrieval/staging runs inside
+        // prepare_ubatches, which also yields the base slot infos.
+        llama_kv_cache::slot_info_vec_t sinfos_base;
+        if (!attn_kvmem_->prepare_ubatches(ubatches, balloc.get_n_tokens(), sinfos_base)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare KVMem base ubatches\n", __func__);
+            break;
+        }
+        if (sinfos_base.empty()) {
+            break;
+        }
+
+        auto sinfos_swa = get_swa()->prepare(ubatches);
+        if (sinfos_swa.empty()) {
+            break;
+        }
+
+        GGML_ASSERT(sinfos_base.size() == sinfos_swa.size());
+
+        return std::make_unique<llama_kv_cache_iswa_context>(
+                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+    } while (false);
+
+    return std::make_unique<llama_kv_cache_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+}
+
+void llama_memory_kvmem_swa::clear(bool data) {
+    llama_kv_cache_iswa::clear(data);
+    if (attn_kvmem_) {
+        attn_kvmem_->reset_policy();
+    }
+}
+
+bool llama_memory_kvmem_swa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // Base cells AND KVMem block metadata go through the slot-pool; the SWA
+    // cache keeps its native rolling semantics. Evaluate both sides even if
+    // one fails (matches stock iswa's non-short-circuit & semantics).
+    const bool base_ok = !attn_kvmem_ || attn_kvmem_->seq_rm(seq_id, p0, p1);
+    const bool swa_ok = get_swa()->seq_rm(seq_id, p0, p1);
+    return base_ok && swa_ok;
+}
+
+bool llama_memory_kvmem_swa::remove_logical(llama_context * ctx, llama_pos begin, llama_pos end) {
+    // Map the logical row to a model position through the base half's cells
+    // BEFORE the base rows are removed (the SWA cache is addressed by model
+    // positions). begin <= 0 is a full clear and needs no mapping.
+    // Every caller today removes to the end; a bounded range has no SWA
+    // mapping implementation yet, so refuse loudly instead of trimming wrong.
+    GGML_ASSERT(end < 0 && "SWA logical removal only supports open-ended ranges");
+    llama_pos model_begin = 0;
+    if (begin > 0) {
+        model_begin = -1;
+        if (attn_kvmem_) {
+            const auto & cells = attn_kvmem_->get_kv()->get_cells(0);
+            llama_pos first = INT32_MAX;
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (cells.is_empty(i)) {
+                    continue;
+                }
+                const auto row = cells.ext_get(i).logical_pos;
+                if (row >= begin && row < first) {
+                    first = row;
+                    model_begin = cells.pos_get(i);
+                }
+            }
+        }
+    }
+    if (!attn_kvmem_ || !attn_kvmem_->remove_logical(ctx, begin, end)) {
+        return false;
+    }
+    if (model_begin >= 0) {
+        return get_swa()->seq_rm(0, model_begin, -1);
+    }
+    return true;
+}
+
+void llama_memory_kvmem_swa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // Mirror iswa's order (base then swa). The base half goes through the wrapper, not
+    // the bare cache: attn_kvmem_ wraps exactly that kv_base, so it advances
+    // attention_epoch_ and its own catch already performs this rollback. Going direct
+    // would leave stale retrieval views valid.
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        if (attn_kvmem_) {
+            attn_kvmem_->state_read(io, seq_id, flags);
+        } else {
+            get_base()->state_read(io, seq_id, flags);
+        }
+    }
+
+    get_swa()->state_read(io, seq_id, flags);
 }
