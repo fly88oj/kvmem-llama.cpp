@@ -13,7 +13,14 @@
 #include <vector>
 #if KVMEM_ENABLE_NVME
 #include <csignal>
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
+#endif
+
+#ifdef _WIN32
+#define setenv(name, value, overwrite) _putenv_s((name), (value))
+#define unsetenv(name) _putenv_s((name), "")
 #endif
 
 #define CHECK(cond)                                                            \
@@ -241,6 +248,10 @@ static void test_capacity_failure() {
     std::filesystem::remove(cfg.nvme_dir);
 }
 
+// The deterministic write failure below is forced through RLIMIT_FSIZE and
+// SIGXFSZ, which have no Win32 equivalents; the Win32 platform layer's own
+// error handling is covered by the other suites.
+#ifndef _WIN32
 static void test_write_failure() {
     const auto cfg = failure_config();
     for (bool recover : {false, true}) {
@@ -276,7 +287,8 @@ static void test_write_failure() {
     }
     std::filesystem::remove(cfg.nvme_dir);
 }
-#endif
+#endif  // !_WIN32
+#endif  // KVMEM_ENABLE_NVME
 
 int main() {
 #if KVMEM_ENABLE_NVME
@@ -284,7 +296,11 @@ int main() {
     const bool had_sync = previous_sync != nullptr;
     const std::string saved_sync = previous_sync ? previous_sync : "";
     test_capacity_failure();
+#ifndef _WIN32
+    // The deterministic write failure is forced through RLIMIT_FSIZE/SIGXFSZ,
+    // which have no Win32 equivalents.
     test_write_failure();
+#endif
     if (had_sync) CHECK(setenv("KVMEM_HARVEST_SYNC", saved_sync.c_str(), 1) == 0);
     else CHECK(unsetenv("KVMEM_HARVEST_SYNC") == 0);
     std::puts("raw NVMe: capacity refusal, failed-write retention, drain and clear recovery passed");
