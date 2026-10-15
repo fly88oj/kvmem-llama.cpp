@@ -17,8 +17,9 @@ def git(directory, *args, check=True, env=None):
                           capture_output=True, text=True, env=env)
 
 
-def verify_tree(directory, expected):
-    # A separate index includes patch-added files without changing the user's index.
+def worktree_hash(directory):
+    # Hash of HEAD + all working-tree changes, via a separate index so
+    # patch-added files are included without touching the user's index.
     handle, filename = tempfile.mkstemp(prefix='kvmem-backend-', suffix='.index')
     os.close(handle)
     os.unlink(filename)
@@ -26,13 +27,17 @@ def verify_tree(directory, expected):
     try:
         git(directory, 'read-tree', 'HEAD', env=env)
         git(directory, 'add', '-A', env=env)
-        actual = git(directory, 'write-tree', env=env).stdout.strip()
-        if actual != expected:
-            raise RuntimeError(f'{directory}: source differs from the pinned integration patch; '
-                               'record backend edits in its patch before release validation')
+        return git(directory, 'write-tree', env=env).stdout.strip()
     finally:
         if Path(filename).exists():
             os.unlink(filename)
+
+
+def verify_tree(directory, expected):
+    actual = worktree_hash(directory)
+    if actual != expected:
+        raise RuntimeError(f'{directory}: source differs from the pinned integration patch; '
+                           'record backend edits in its patch before release validation')
 
 
 def prepare(name, entry, check_only):
@@ -67,21 +72,40 @@ def prepare(name, entry, check_only):
     # Fork overlay patch (fly88oj): applied on top of the pinned upstream
     # integration patch. Tracked the same way (sha256 in versions.json). The
     # fork edits sit next to upstream hunks, so upstream's reverse-check
-    # readiness probe no longer matches; apply forward whatever layer is
-    # missing instead.
+    # readiness probe no longer matches; instead classify the working tree by
+    # its hash and drive it to the fully layered state:
+    #   base tree            -> apply official, then fork
+    #   official patched     -> apply fork only
+    #   fork layered tree    -> ready
+    #   anything else        -> refuse (mixed/partial/dirty tree)
     fork_patch = entry.get('fork_patch')
     if fork_patch:
         fp = ROOT / fork_patch
         if hashlib.sha256(fp.read_bytes()).hexdigest() != entry['fork_patch_sha256']:
             raise RuntimeError(f'{name}: update versions.json after changing the fork patch')
-        if git(directory, 'apply', '--check', str(patch), check=False).returncode == 0:
+        base_tree = git(directory, 'rev-parse', 'HEAD^{tree}').stdout.strip()
+        current = worktree_hash(directory)
+        if current == entry.get('fork_patched_tree'):
+            pass  # fully layered
+        elif current == base_tree:
             if check_only:
                 raise RuntimeError(f'{name}: integration patch is missing')
+            git(directory, 'apply', '--check', str(patch))
             git(directory, 'apply', '--whitespace=nowarn', str(patch))
-        if git(directory, 'apply', '--check', str(fp), check=False).returncode == 0:
+            git(directory, 'apply', '--check', str(fp))
+            git(directory, 'apply', '--whitespace=nowarn', str(fp))
+        elif current == entry['patched_tree']:
             if check_only:
                 raise RuntimeError(f'{name}: fork patch is missing')
+            git(directory, 'apply', '--check', str(fp))
             git(directory, 'apply', '--whitespace=nowarn', str(fp))
+        else:
+            raise RuntimeError(
+                f'{name}: {entry["path"]} is in a mixed or partially patched state; '
+                f'run: git -C {entry["path"]} reset --hard {entry["base_commit"]} '
+                f'(and delete untracked files it reports), then re-run prepare')
+        if check_only and not entry.get('fork_patched_tree'):
+            raise RuntimeError(f'{name}: versions.json needs a fork_patched_tree entry')
         suffix = f' + {fp.name}'
     else:
         ready = git(directory, 'apply', '--reverse', '--check', str(patch), check=False)

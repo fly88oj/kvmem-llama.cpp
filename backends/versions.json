@@ -11,7 +11,8 @@
     "patched_tree": "b190e67570206f5f1aa8c2adbc1cb05c914d9354",
     "fork_patch": "backends/patches/llamacpp-kvmem-fork.patch",
     "fork_patch_sha256": "e4eb83eacbac99f8a01c4cc32950df910fd3d1526b48d557c054d01e56aa3442",
-    "fork_local_changes": "fork extras on top of the pinned patch: gemma4 capture hooks, batched seq_rm_logical_ranges, kv-cells holes fix, getenv caching, LM Studio parallel clamp (KVMEM_ENABLE=0 restores stock multi-slot)"
+    "fork_local_changes": "fork extras on top of the pinned patch: gemma4 capture hooks, batched seq_rm_logical_ranges, kv-cells holes fix, getenv caching, LM Studio parallel clamp (KVMEM_ENABLE=0 restores stock multi-slot)",
+    "fork_patched_tree": "c436b44b2d4309f694cfbf61a2a5b8e8ed03fdc9"
   },
   "ninfer": {
     "path": "backends/ninfer",
